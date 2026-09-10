@@ -1,9 +1,5 @@
 import os
 import datetime
-
-def get_jst_today():
-    return (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=9)).date()
-
 import io
 import re
 import pandas as pd
@@ -266,11 +262,9 @@ def load_all_data(path):
     df_rep["Date"] = pd.to_datetime(df_rep["Date"]).dt.strftime("%Y/%m/%d")
     
     val_str_series = df_rec["Value"].astype(str)
-    has_comma_decimal = val_str_series.str.contains(r'^\d+,\d+$', regex=True)
-    val_clean = val_str_series.copy()
-    val_clean[has_comma_decimal] = val_clean[has_comma_decimal].str.replace(',', '.', regex=False)
+    # カンマ(,), パーセント(%), 不等号(< >) の単純除去（カンマは全て3桁区切りとして除去）
     val_clean = (
-        val_clean
+        val_str_series
         .str.replace(",", "", regex=False)
         .str.replace("%", "", regex=False)
         .str.replace("<", "", regex=False)
@@ -333,7 +327,7 @@ with tab1:
     
     with col_input1:
         # ③ 日付の選択 (原則当日、変更可)
-        input_date = st.date_input("③ 点検日を選択", get_jst_today())
+        input_date = st.date_input("③ 点検日を選択", datetime.date.today())
         input_date_str = input_date.strftime("%Y/%m/%d")
         
     with col_input2:
@@ -586,9 +580,9 @@ with tab2:
                 min_d = site_dates_dt.min().date()
                 max_d = site_dates_dt.max().date()
             else:
-                all_date_strs = [get_jst_today().strftime("%Y/%m/%d")]
+                all_date_strs = [datetime.date.today().strftime("%Y/%m/%d")]
                 min_d = datetime.date(2023, 1, 1)
-                max_d = get_jst_today()
+                max_d = datetime.date.today()
 
             # 状態更新用コールバック関数 (最も近い実点検日へ自動アラインメント)
             def update_range_state(target_s_d, target_e_d):
@@ -860,7 +854,7 @@ with tab3:
             ws.title = f"{selected_sheet_type}_集計"
             
             ws.append([f"◆ {site_name} 【{selected_sheet_type}】 全点検データ一覧表"])
-            ws.append([f"出力日時: {(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=9)).strftime('%Y/%m/%d %H:%M')}"])
+            ws.append([f"出力日時: {datetime.datetime.now().strftime('%Y/%m/%d %H:%M')}"])
             ws.append([])
             
             header1 = ["日付"] + [loc_name for _, loc_name, _ in col_defs] + ["備考"]
