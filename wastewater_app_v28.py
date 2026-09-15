@@ -5,6 +5,7 @@ import re
 import pandas as pd
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import openpyxl
@@ -138,14 +139,22 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
                 pass
         return None
 
+    def find_item(df_scope, name_prefix):
+        if df_scope.empty:
+            return df_scope
+        match = df_scope[df_scope['Item_Name'] == name_prefix]
+        if match.empty:
+            match = df_scope[df_scope['Item_Name'].str.startswith(name_prefix, na=False)]
+        return match
+
     # 1. 有機割合 [%] (MLVSS/MLSS*100) & 無機割合 [%] (100 - 有機割合)
     locs_in_site = df_loc_all[df_loc_all['Site_ID'] == selected_site_id]['Loc_ID'].unique()
     for loc_id in locs_in_site:
         loc_items = df_item_all[(df_item_all['Loc_ID'] == loc_id) & (df_item_all['Sheet_Type'] == selected_sheet_type)]
-        mlss_item = loc_items[loc_items['Item_Name'].isin(['MLSS', 'MLSS(簡)'])]
-        mlvss_item = loc_items[loc_items['Item_Name'] == 'MLVSS']
-        org_item = loc_items[loc_items['Item_Name'] == '有機割合']
-        inorg_item = loc_items[loc_items['Item_Name'] == '無機割合']
+        mlss_item = find_item(loc_items, 'MLSS')
+        mlvss_item = find_item(loc_items, 'MLVSS')
+        org_item = find_item(loc_items, '有機割合')
+        inorg_item = find_item(loc_items, '無機割合')
         
         if not mlss_item.empty and not mlvss_item.empty:
             mlss_v = _parse_val(mlss_item.iloc[0]['Item_ID'])
@@ -163,13 +172,13 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         site_items = df_item_all.merge(df_loc_all[df_loc_all['Site_ID'] == selected_site_id], on='Loc_ID')
         site_items = site_items[site_items['Sheet_Type'] == '点検管理表']
         
-        isou_item = site_items[site_items['Item_Name'] == '移送量']
-        hensou_item = site_items[site_items['Item_Name'] == '返送量']
+        isou_item = find_item(site_items, '移送量')
+        hensou_item = find_item(site_items, '返送量')
         
         aeration_end = site_items[site_items['Loc_Name'] == '曝気槽（末端側）']
-        mlss_item = aeration_end[aeration_end['Item_Name'].isin(['MLSS', 'MLSS(簡)'])]
-        temp_item = aeration_end[aeration_end['Item_Name'] == '水温']
-        sv30_item = aeration_end[aeration_end['Item_Name'] == 'SV30']
+        mlss_item = find_item(aeration_end, 'MLSS')
+        temp_item = find_item(aeration_end, '水温')
+        sv30_item = find_item(aeration_end, 'SV30')
         
         isou_v = _parse_val(isou_item.iloc[0]['Item_ID']) if not isou_item.empty else None
         hensou_v = _parse_val(hensou_item.iloc[0]['Item_ID']) if not hensou_item.empty else None
@@ -177,8 +186,8 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         temp_v = _parse_val(temp_item.iloc[0]['Item_ID']) if not temp_item.empty else None
         sv30_v = _parse_val(sv30_item.iloc[0]['Item_ID']) if not sv30_item.empty else None
         
-        load_item = site_items[site_items['Item_Name'] == '水面積負荷']
-        return_ratio_item = site_items[site_items['Item_Name'] == '返送率']
+        load_item = find_item(site_items, '水面積負荷')
+        return_ratio_item = find_item(site_items, '返送率')
         settling_item = site_items[site_items['Item_Name'] == '沈降速度']
         ratio_item = site_items[site_items['Item_Name'] == '沈降速度/水面積負荷']
         
@@ -215,86 +224,7 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
                 
     return calc_updates
 
-
-
-import urllib.request
-import urllib.error
-import json
-import base64
-
-def sync_to_github(db_path, commit_message="Update DB via Streamlit App"):
-    """Sync local DB file to GitHub repository via REST API if Secrets are configured."""
-    github_token = None
-    github_repo = None
-    
-    try:
-        if hasattr(st, "secrets"):
-            github_token = st.secrets.get("GITHUB_TOKEN", None)
-            github_repo = st.secrets.get("GITHUB_REPO", None)
-    except Exception:
-        pass
-        
-    if not github_token or not github_repo:
-        return False, "GitHub Secrets (GITHUB_TOKEN / GITHUB_REPO) 未設定"
-        
-    try:
-        repo_clean = github_repo.strip().replace("https://github.com/", "").strip("/")
-        file_name = os.path.basename(db_path)
-        api_url = f"https://api.github.com/repos/{repo_clean}/contents/{file_name}"
-        
-        headers = {
-            "Authorization": f"Bearer {github_token}",
-            "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "StreamlitWastewaterApp"
-        }
-        
-        # 1. Get current SHA if exists
-        sha = None
-        req_get = urllib.request.Request(api_url, headers=headers, method="GET")
-        try:
-            with urllib.request.urlopen(req_get, timeout=10) as resp:
-                res_data = json.loads(resp.read().decode("utf-8"))
-                sha = res_data.get("sha")
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                sha = None
-            else:
-                return False, f"GitHub API エラー ({e.code}): リポジトリ名またはアクセス権限をご確認ください。"
-        except Exception as e:
-            return False, f"GitHub接続エラー: {str(e)}"
-            
-        # 2. Read local file and base64 encode
-        if not os.path.exists(db_path):
-            return False, f"ローカルDBファイルが見つかりません: {db_path}"
-            
-        with open(db_path, "rb") as f:
-            content_b64 = base64.b64encode(f.read()).decode("utf-8")
-            
-        payload = {
-            "message": commit_message,
-            "content": content_b64
-        }
-        if sha:
-            payload["sha"] = sha
-            
-        json_data = json.dumps(payload).encode("utf-8")
-        req_put = urllib.request.Request(api_url, data=json_data, headers=headers, method="PUT")
-        
-        with urllib.request.urlopen(req_put, timeout=15) as resp:
-            if resp.status in [200, 201]:
-                return True, "成功"
-            else:
-                return False, f"HTTP ステータス: {resp.status}"
-                
-    except Exception as e:
-        return False, f"自動同期中に例外が発生しました: {str(e)}"
-
-
 # DBファイルパスの取得
-DB_FILENAME_V2 = "wastewater-appsheet-db-v2.xlsx"
-DB_FILENAME_V1 = "wastewater-appsheet-db.xlsx"
-
-@st.cache_data(ttl=1)
 def get_db_path():
     if os.path.exists(DB_FILENAME_V2):
         return DB_FILENAME_V2
@@ -357,6 +287,27 @@ if df_site is None:
     st.stop()
 
 # タイトル表示
+
+# スマホ入力用：テンキー（数字キーボード）自動呼び出し機能
+components.html("""
+<script>
+function setNumericInputMode() {
+    try {
+        const pDoc = window.parent.document;
+        const inputs = pDoc.querySelectorAll('input[type="text"]');
+        inputs.forEach(input => {
+            if (!input.id.includes('login') && !input.getAttribute('inputmode')) {
+                input.setAttribute('inputmode', 'decimal');
+            }
+        });
+    } catch(e) {}
+}
+setNumericInputMode();
+const observer = new MutationObserver(setNumericInputMode);
+observer.observe(window.parent.document.body, { childList: true, subtree: true });
+</script>
+""", height=0, width=0)
+
 st.markdown("<div class='main-header'>🌱 排水処理点検・水質データ管理システム (KBL Management App)</div>", unsafe_allow_html=True)
 
 # サイドバー：グローバル選択ヘッダー
@@ -397,9 +348,6 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # TAB 1: 点検データ入力 (要件①〜④) + 異常値チェック
 # ------------------------------------------
 with tab1:
-    if "save_success_msg" in st.session_state:
-        st.success(st.session_state["save_success_msg"])
-        del st.session_state["save_success_msg"]
     st.markdown("<div class='sub-header'>📝 点検結果の新規入力 ＆ 蓄積 (過去データとの異常値チェック機能付き)</div>", unsafe_allow_html=True)
     
     col_input1, col_input2 = st.columns(2)
@@ -570,15 +518,7 @@ with tab1:
                             
                     wb.save(db_path)
                     st.cache_data.clear()
-                    
-                    synced, sync_msg = sync_to_github(db_path, f"Data update: {input_date_str} {loc_options[selected_loc_id]}")
-                    if synced:
-                        st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを保存しました（GitHubへの自動同期も成功しました）"
-                    else:
-                        if "未設定" in sync_msg:
-                            st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました！"
-                        else:
-                            st.session_state["save_success_msg"] = f"⚠️ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データをローカル保存しました。（GitHub同期エラー: {sync_msg}）"
+                    st.success(f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました！")
                     st.rerun()
 
 # ------------------------------------------
