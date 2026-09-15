@@ -5,30 +5,6 @@ import re
 import pandas as pd
 import numpy as np
 import streamlit as st
-import streamlit.components.v1 as components
-
-components.html("""
-<script>
-function forceNumericKeypad() {
-    try {
-        const parentDoc = window.parent.document;
-        const inputs = parentDoc.querySelectorAll('input');
-        inputs.forEach(input => {
-            if (input.type === 'text' && !input.readOnly && !input.disabled) {
-                const label = input.getAttribute('aria-label') || '';
-                if (!label.includes('パスワード') && !label.includes('Password') && !label.includes('リポジトリ')) {
-                    input.setAttribute('inputmode', 'decimal');
-                    input.setAttribute('pattern', '[0-9.]*');
-                }
-            }
-        });
-    } catch(e) {}
-}
-forceNumericKeypad();
-setInterval(forceNumericKeypad, 300);
-</script>
-""", height=0, width=0)
-
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import openpyxl
@@ -145,7 +121,7 @@ if not st.session_state["authenticated"]:
 # ==========================================
 def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_sheet_type, form_data_dict, df_rec_latest, target_rep_id):
     calc_updates = {}
-
+    
     def _parse_val(item_id):
         if item_id in form_data_dict:
             v_str = str(form_data_dict[item_id]).replace(',', '').replace('%', '').replace('<', '').replace('>', '').strip()
@@ -161,84 +137,6 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
             except ValueError:
                 pass
         return None
-
-    # 1. 有機割合 [%] (MLVSS/MLSS*100) & 無機割合 [%] (100 - 有機割合)
-    locs_in_site = df_loc_all[df_loc_all['Site_ID'] == selected_site_id]['Loc_ID'].unique()
-    for loc_id in locs_in_site:
-        loc_items = df_item_all[(df_item_all['Loc_ID'] == loc_id) & (df_item_all['Sheet_Type'] == selected_sheet_type)]
-        mlss_item = loc_items[loc_items['Item_Name'].isin(['MLSS', 'MLSS(簡)'])]
-        mlvss_item = loc_items[loc_items['Item_Name'] == 'MLVSS']
-        org_item = loc_items[loc_items['Item_Name'].str.startswith('有機割合')]
-        inorg_item = loc_items[loc_items['Item_Name'].str.startswith('無機割合')]
-
-        if not mlss_item.empty and not mlvss_item.empty:
-            mlss_v = _parse_val(mlss_item.iloc[0]['Item_ID'])
-            mlvss_v = _parse_val(mlvss_item.iloc[0]['Item_ID'])
-            if mlss_v and mlss_v > 0 and mlvss_v is not None:
-                org_ratio = round((mlvss_v / mlss_v) * 100.0, 1)
-                inorg_ratio = round(100.0 - org_ratio, 1)
-                if not org_item.empty:
-                    calc_updates[org_item.iloc[0]['Item_ID']] = f"{org_ratio}%"
-                if not inorg_item.empty:
-                    calc_updates[inorg_item.iloc[0]['Item_ID']] = f"{inorg_ratio}%"
-
-    # 2. キャンパック（S004/S005）専用計算 (沈降速度, 水面積負荷, 沈降速度/水面積負荷, 返送率)
-    if selected_site_id in ['S004', 'S005'] and selected_sheet_type == '点検管理表':
-        site_items = df_item_all.merge(df_loc_all[df_loc_all['Site_ID'] == selected_site_id], on='Loc_ID')
-        site_items = site_items[site_items['Sheet_Type'] == '点検管理表']
-
-        isou_item = site_items[site_items['Item_Name'].str.startswith('移送量')]
-        hensou_item = site_items[site_items['Item_Name'].str.startswith('返送量')]
-
-        aeration_end = site_items[site_items['Loc_Name'] == '曝気槽（末端側）']
-        mlss_item = aeration_end[aeration_end['Item_Name'].isin(['MLSS', 'MLSS(簡)'])]
-        temp_item = aeration_end[aeration_end['Item_Name'] == '水温']
-        sv30_item = aeration_end[aeration_end['Item_Name'] == 'SV30']
-
-        isou_v = _parse_val(isou_item.iloc[0]['Item_ID']) if not isou_item.empty else None
-        hensou_v = _parse_val(hensou_item.iloc[0]['Item_ID']) if not hensou_item.empty else None
-        mlss_v = _parse_val(mlss_item.iloc[0]['Item_ID']) if not mlss_item.empty else None
-        temp_v = _parse_val(temp_item.iloc[0]['Item_ID']) if not temp_item.empty else None
-        sv30_v = _parse_val(sv30_item.iloc[0]['Item_ID']) if not sv30_item.empty else None
-
-        load_item = site_items[site_items['Item_Name'].str.startswith('水面積負荷')]
-        return_ratio_item = site_items[site_items['Item_Name'].str.startswith('返送率')]
-        settling_item = site_items[site_items['Item_Name'] == '沈降速度']
-        ratio_item = site_items[site_items['Item_Name'] == '沈降速度/水面積負荷']
-
-        # 水面積負荷 = 移送量 / 143
-        surf_load = None
-        if isou_v is not None and isou_v > 0:
-            surf_load = round(isou_v / 143.0, 2)
-            if not load_item.empty:
-                calc_updates[load_item.iloc[0]['Item_ID']] = str(surf_load)
-
-        # 返送率 [%] = 返送量 / 移送量 * 100
-        if isou_v is not None and isou_v > 0 and hensou_v is not None and hensou_v >= 0:
-            r_ratio = round((hensou_v / isou_v) * 100.0, 1)
-            if not return_ratio_item.empty:
-                calc_updates[return_ratio_item.iloc[0]['Item_ID']] = f"{r_ratio}%"
-
-        # 沈降速度 [m/h]
-        v_settling = None
-        if mlss_v is not None and mlss_v > 0 and temp_v is not None and temp_v > 0 and sv30_v is not None and sv30_v > 0:
-            try:
-                sv_term = (sv30_v * 10000.0) / mlss_v
-                v_settling = (1.78 * (10**7) * (mlss_v**(-1.46)) * (temp_v**(0.853)) * (sv_term**(-0.804))) / 24.0
-                v_settling = round(v_settling, 2)
-                if not settling_item.empty:
-                    calc_updates[settling_item.iloc[0]['Item_ID']] = str(v_settling)
-            except Exception:
-                pass
-
-        # 沈降速度 / 水面積負荷
-        if v_settling is not None and surf_load is not None and surf_load > 0:
-            ratio_val = round(v_settling / surf_load, 2)
-            if not ratio_item.empty:
-                calc_updates[ratio_item.iloc[0]['Item_ID']] = str(ratio_val)
-
-    return calc_updates
-
 
     # 1. 有機割合 [%] (MLVSS/MLSS*100) & 無機割合 [%] (100 - 有機割合)
     locs_in_site = df_loc_all[df_loc_all['Site_ID'] == selected_site_id]['Loc_ID'].unique()
@@ -265,8 +163,8 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         site_items = df_item_all.merge(df_loc_all[df_loc_all['Site_ID'] == selected_site_id], on='Loc_ID')
         site_items = site_items[site_items['Sheet_Type'] == '点検管理表']
         
-        isou_item = site_items[site_items['Item_Name'] == '移送量']
-        hensou_item = site_items[site_items['Item_Name'] == '返送量']
+        isou_item = site_items[site_items['Item_Name'].str.startswith('移送量')]
+        hensou_item = site_items[site_items['Item_Name'].str.startswith('返送量')]
         
         aeration_end = site_items[site_items['Loc_Name'] == '曝気槽（末端側）']
         mlss_item = aeration_end[aeration_end['Item_Name'].isin(['MLSS', 'MLSS(簡)'])]
@@ -279,10 +177,10 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         temp_v = _parse_val(temp_item.iloc[0]['Item_ID']) if not temp_item.empty else None
         sv30_v = _parse_val(sv30_item.iloc[0]['Item_ID']) if not sv30_item.empty else None
         
-        load_item = site_items[site_items['Item_Name'] == '水面積負荷']
-        return_ratio_item = site_items[site_items['Item_Name'] == '返送率']
-        settling_item = site_items[site_items['Item_Name'] == '沈降速度']
-        ratio_item = site_items[site_items['Item_Name'] == '沈降速度/水面積負荷']
+        load_item = site_items[site_items['Item_Name'].str.startswith('水面積負荷')]
+        return_ratio_item = site_items[site_items['Item_Name'].str.startswith('返送率')]
+        settling_item = site_items[site_items['Item_Name'].str.startswith('沈降速度') & ~site_items['Item_Name'].str.contains('水面積負荷')]
+        ratio_item = site_items[site_items['Item_Name'].str.contains('沈降速度') & site_items['Item_Name'].str.contains('水面積負荷')]
         
         # 水面積負荷 = 移送量 / 143
         surf_load = None
@@ -341,6 +239,63 @@ db_path = get_db_path()
 # 2. データ読み込み ＆ キャッシュ処理 (パーセント・不等号クレンジング強化)
 # ==========================================
 @st.cache_data(ttl=1)
+
+def sync_to_github_api(file_path):
+    """Syncs local excel db file to GitHub repo using st.secrets['GITHUB_TOKEN']"""
+    try:
+        if "GITHUB_TOKEN" not in st.secrets:
+            return False, "GITHUB_TOKEN未設定"
+        
+        token = st.secrets["GITHUB_TOKEN"]
+        repo = st.secrets.get("GITHUB_REPO", "kbl-wastewater-app")
+        branch = st.secrets.get("GITHUB_BRANCH", "main")
+        target_path = "wastewater-appsheet-db-v2.xlsx"
+        
+        import base64
+        import json
+        import urllib.request
+        import urllib.error
+        import pandas as pd
+        
+        url = f"https://api.github.com/repos/{repo}/contents/{target_path}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "StreamlitApp"
+        }
+        
+        sha = None
+        req_get = urllib.request.Request(f"{url}?ref={branch}", headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req_get) as resp:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                sha = res_data.get("sha")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                return False, f"HTTP Error {e.code}"
+                
+        with open(file_path, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode("utf-8")
+            
+        payload = {
+            "message": f"Auto-update wastewater data via App [{pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}]",
+            "content": content_b64,
+            "branch": branch
+        }
+        if sha:
+            payload["sha"] = sha
+            
+        data_json = json.dumps(payload).encode("utf-8")
+        req_put = urllib.request.Request(url, data=data_json, headers=headers, method="PUT")
+        
+        with urllib.request.urlopen(req_put) as resp:
+            if resp.status in [200, 201]:
+                return True, "Success"
+            return False, f"HTTP {resp.status}"
+    except Exception as ex:
+        return False, str(ex)
+
+
 def load_all_data(path):
     if not os.path.exists(path):
         st.error(f"データベースファイルが見つかりません: {path}")
@@ -425,6 +380,24 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # TAB 1: 点検データ入力 (要件①〜④) + 異常値チェック
 # ------------------------------------------
 with tab1:
+    if "save_success_msg" in st.session_state:
+        st.success(st.session_state["save_success_msg"])
+        del st.session_state["save_success_msg"]
+        import streamlit.components.v1 as components
+    components.html(
+        """
+        <script>
+        function setNumericKeypad() {
+            const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+            inputs.forEach(input => {
+                input.setAttribute('inputmode', 'decimal');
+            });
+        }
+        setInterval(setNumericKeypad, 1000);
+        </script>
+        """,
+        height=0,
+    )
     st.markdown("<div class='sub-header'>📝 点検結果の新規入力 ＆ 蓄積 (過去データとの異常値チェック機能付き)</div>", unsafe_allow_html=True)
     
     col_input1, col_input2 = st.columns(2)
@@ -595,7 +568,12 @@ with tab1:
                             
                     wb.save(db_path)
                     st.cache_data.clear()
-                    st.success(f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました！")
+                    
+                    sync_ok, sync_msg = sync_to_github_api(db_path)
+                    if sync_ok:
+                        st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました（GitHubへの自動同期も成功しました）！"
+                    else:
+                        st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました（GitHub自動同期: {sync_msg}）"
                     st.rerun()
 
 # ------------------------------------------
