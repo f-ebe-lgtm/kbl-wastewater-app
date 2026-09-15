@@ -139,14 +139,26 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
                 pass
         return None
 
+    def _find_items(df_subset, name_query):
+        exact = df_subset[df_subset['Item_Name'] == name_query]
+        if not exact.empty:
+            return exact
+        prefix = df_subset[df_subset['Item_Name'].astype(str).str.startswith(name_query)]
+        if not prefix.empty:
+            return prefix
+        contains = df_subset[df_subset['Item_Name'].astype(str).str.contains(name_query, regex=False)]
+        return contains
+
     # 1. 有機割合 [%] (MLVSS/MLSS*100) & 無機割合 [%] (100 - 有機割合)
     locs_in_site = df_loc_all[df_loc_all['Site_ID'] == selected_site_id]['Loc_ID'].unique()
     for loc_id in locs_in_site:
         loc_items = df_item_all[(df_item_all['Loc_ID'] == loc_id) & (df_item_all['Sheet_Type'] == selected_sheet_type)]
-        mlss_item = loc_items[loc_items['Item_Name'].isin(['MLSS', 'MLSS(簡)'])]
-        mlvss_item = loc_items[loc_items['Item_Name'] == 'MLVSS']
-        org_item = loc_items[loc_items['Item_Name'] == '有機割合']
-        inorg_item = loc_items[loc_items['Item_Name'] == '無機割合']
+        mlss_item = _find_items(loc_items, 'MLSS')
+        if mlss_item.empty:
+            mlss_item = _find_items(loc_items, 'MLSS(簡)')
+        mlvss_item = _find_items(loc_items, 'MLVSS')
+        org_item = _find_items(loc_items, '有機割合')
+        inorg_item = _find_items(loc_items, '無機割合')
         
         if not mlss_item.empty and not mlvss_item.empty:
             mlss_v = _parse_val(mlss_item.iloc[0]['Item_ID'])
@@ -164,13 +176,13 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         site_items = df_item_all.merge(df_loc_all[df_loc_all['Site_ID'] == selected_site_id], on='Loc_ID')
         site_items = site_items[site_items['Sheet_Type'] == '点検管理表']
         
-        isou_item = site_items[site_items['Item_Name'] == '移送量']
-        hensou_item = site_items[site_items['Item_Name'] == '返送量']
+        isou_item = _find_items(site_items, '移送量')
+        hensou_item = _find_items(site_items, '返送量')
         
         aeration_end = site_items[site_items['Loc_Name'] == '曝気槽（末端側）']
-        mlss_item = aeration_end[aeration_end['Item_Name'].isin(['MLSS', 'MLSS(簡)'])]
-        temp_item = aeration_end[aeration_end['Item_Name'] == '水温']
-        sv30_item = aeration_end[aeration_end['Item_Name'] == 'SV30']
+        mlss_item = _find_items(aeration_end, 'MLSS')
+        temp_item = _find_items(aeration_end, '水温')
+        sv30_item = _find_items(aeration_end, 'SV30')
         
         isou_v = _parse_val(isou_item.iloc[0]['Item_ID']) if not isou_item.empty else None
         hensou_v = _parse_val(hensou_item.iloc[0]['Item_ID']) if not hensou_item.empty else None
@@ -178,10 +190,15 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         temp_v = _parse_val(temp_item.iloc[0]['Item_ID']) if not temp_item.empty else None
         sv30_v = _parse_val(sv30_item.iloc[0]['Item_ID']) if not sv30_item.empty else None
         
-        load_item = site_items[site_items['Item_Name'] == '水面積負荷']
-        return_ratio_item = site_items[site_items['Item_Name'] == '返送率']
-        settling_item = site_items[site_items['Item_Name'] == '沈降速度']
+        load_item = _find_items(site_items, '水面積負荷')
+        return_ratio_item = _find_items(site_items, '返送率')
+        settling_item = _find_items(site_items, '沈降速度')
         ratio_item = site_items[site_items['Item_Name'] == '沈降速度/水面積負荷']
+        if ratio_item.empty:
+            ratio_item = _find_items(site_items, '沈降速度/水面積負荷')
+            
+        if not settling_item.empty:
+            settling_item = settling_item[~settling_item['Item_Name'].astype(str).str.contains('水面積負荷')]
         
         # 水面積負荷 = 移送量 / 143
         surf_load = None
@@ -215,8 +232,6 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
                 calc_updates[ratio_item.iloc[0]['Item_ID']] = str(ratio_val)
                 
     return calc_updates
-
-
 # DBファイルパスの取得
 DB_FILENAME_V2 = "wastewater-appsheet-db-v2.xlsx"
 DB_FILENAME_V1 = "wastewater-appsheet-db.xlsx"
@@ -240,6 +255,61 @@ db_path = get_db_path()
 # 2. データ読み込み ＆ キャッシュ処理 (パーセント・不等号クレンジング強化)
 # ==========================================
 @st.cache_data(ttl=1)
+def sync_to_github_api(file_path):
+    """Syncs local file to GitHub repository using GitHub REST API and st.secrets['GITHUB_TOKEN']"""
+    try:
+        if "GITHUB_TOKEN" not in st.secrets:
+            return False, "GITHUB_TOKEN is not set in st.secrets"
+        
+        token = st.secrets["GITHUB_TOKEN"]
+        repo = st.secrets.get("GITHUB_REPO", "kbl-wastewater-app")
+        branch = st.secrets.get("GITHUB_BRANCH", "main")
+        target_path = "wastewater-appsheet-db-v3.xlsx"
+        
+        import base64
+        import json
+        import urllib.request
+        import urllib.error
+        
+        url = f"https://api.github.com/repos/{repo}/contents/{target_path}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "StreamlitApp"
+        }
+        
+        sha = None
+        req_get = urllib.request.Request(f"{url}?ref={branch}", headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req_get) as resp:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                sha = res_data.get("sha")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                return False, f"HTTP Error {e.code} during SHA fetch"
+                
+        with open(file_path, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode("utf-8")
+            
+        payload = {
+            "message": f"Auto-update wastewater data via App [{pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}]",
+            "content": content_b64,
+            "branch": branch
+        }
+        if sha:
+            payload["sha"] = sha
+            
+        data_json = json.dumps(payload).encode("utf-8")
+        req_put = urllib.request.Request(url, data=data_json, headers=headers, method="PUT")
+        
+        with urllib.request.urlopen(req_put) as resp:
+            if resp.status in [200, 201]:
+                return True, "Success"
+            return False, f"HTTP Status {resp.status}"
+    except Exception as ex:
+        return False, str(ex)
+
+
 def load_all_data(path):
     if not os.path.exists(path):
         st.error(f"データベースファイルが見つかりません: {path}")
@@ -323,6 +393,21 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # ------------------------------------------
 # TAB 1: 点検データ入力 (要件①〜④) + 異常値チェック
 # ------------------------------------------
+# テンキー自動表示JS
+components.html("""
+<script>
+    function setInputMode() {
+        const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+        inputs.forEach(input => {
+            if (!input.getAttribute('inputmode')) {
+                input.setAttribute('inputmode', 'decimal');
+            }
+        });
+    }
+    setInterval(setInputMode, 500);
+</script>
+""", height=0, width=0)
+
 with tab1:
     st.markdown("<div class='sub-header'>📝 点検結果の新規入力 ＆ 蓄積 (過去データとの異常値チェック機能付き)</div>", unsafe_allow_html=True)
     
@@ -494,7 +579,12 @@ with tab1:
                             
                     wb.save(db_path)
                     st.cache_data.clear()
-                    st.success(f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました！")
+                    
+                    sync_ok, sync_msg = sync_to_github_api(db_path)
+                    if sync_ok:
+                        st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました（GitHubへの自動同期も成功しました）！"
+                    else:
+                        st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました（ローカル更新完了 / GitHub同期: {sync_msg}）"
                     st.rerun()
 
 # ------------------------------------------
