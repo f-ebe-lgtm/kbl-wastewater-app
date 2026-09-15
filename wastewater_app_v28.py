@@ -332,6 +332,7 @@ def load_all_data(path):
     
     return df_site, df_loc, df_item, df_rep, df_rec
 
+db_path = get_db_path()
 df_site, df_loc, df_item, df_rep, df_rec = load_all_data(db_path)
 
 if df_site is None:
