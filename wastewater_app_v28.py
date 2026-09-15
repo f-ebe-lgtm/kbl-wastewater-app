@@ -1,3 +1,57 @@
+
+import urllib.request
+import urllib.error
+import base64
+
+def commit_file_to_github(repo, file_path_in_repo, local_file_path, token, commit_message="Auto update database from Streamlit"):
+    if not repo or not token:
+        return False, "GITHUB_REPO または GITHUB_TOKEN が Secrets に設定されていません。"
+    url = f"https://api.github.com/repos/{repo}/contents/{file_path_in_repo}"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "Streamlit-App"
+    }
+    sha = None
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            sha = data.get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            return False, f"GitHub 接続エラー ({e.code}): {e.reason}"
+    except Exception as e:
+        return False, f"GitHub 取得エラー: {str(e)}"
+    
+    if not os.path.exists(local_file_path):
+        return False, f"ローカルファイルが見つかりません: {local_file_path}"
+    
+    with open(local_file_path, "rb") as f:
+        content_b64 = base64.b64encode(f.read()).decode('utf-8')
+    
+    payload = {
+        "message": commit_message,
+        "content": content_b64
+    }
+    if sha:
+        payload["sha"] = sha
+        
+    data_json = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(url, data=data_json, headers=headers, method="PUT")
+    
+    try:
+        with urllib.request.urlopen(req) as resp:
+            if resp.status in [200, 201]:
+                return True, "GitHub への自動保存（同期）に成功しました！"
+            else:
+                return False, f"GitHub ステータスコード: {resp.status}"
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode('utf-8', errors='ignore')
+        return False, f"GitHub 同期失敗 ({e.code}): {err_msg}"
+    except Exception as e:
+        return False, f"GitHub 同期エラー: {str(e)}"
+
 import os
 import datetime
 import io
@@ -493,7 +547,34 @@ with tab1:
                             
                     wb.save(db_path)
                     st.cache_data.clear()
-                    st.success(f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました！")
+                    
+                    # GitHub 同期機能 (Secrets から設定取得)
+                    gh_token = None
+                    gh_repo = None
+                    try:
+                        if "GITHUB_TOKEN" in st.secrets:
+                            gh_token = str(st.secrets["GITHUB_TOKEN"]).strip()
+                        if "GITHUB_REPO" in st.secrets:
+                            gh_repo = str(st.secrets["GITHUB_REPO"]).strip()
+                    except Exception:
+                        pass
+                    
+                    if gh_token and gh_repo:
+                        sync_ok, sync_msg = commit_file_to_github(
+                            repo=gh_repo,
+                            file_path_in_repo="wastewater-appsheet-db-v2.xlsx",
+                            local_file_path=db_path,
+                            token=gh_token,
+                            commit_message=f"Auto save inspection data {input_date_str}"
+                        )
+                        if sync_ok:
+                            st.success(f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました！\n\n☁️ **GitHub への自動同期（永久保存）も完了しました！**")
+                        else:
+                            st.success(f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを一時保存しました。")
+                            st.warning(f"⚠️ **GitHub 同期通知**: {sync_msg}")
+                    else:
+                        st.success(f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを保存しました。")
+                    
                     st.rerun()
 
 # ------------------------------------------
