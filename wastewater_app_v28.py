@@ -384,7 +384,7 @@ with tab1:
     
     with col_input1:
         # ③ 日付の選択 (原則当日、変更可)
-        input_date = st.date_input("③ 点検日を選択", value=get_jst_today(), key="input_date_key"))
+        input_date = st.date_input("③ 点検日を選択", value=get_jst_today(), key="input_date_key")
         input_date_str = input_date.strftime("%Y/%m/%d")
         
     with col_input2:
