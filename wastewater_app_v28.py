@@ -1,9 +1,5 @@
 import os
 import datetime
-
-def get_jst_today():
-    jst = datetime.timezone(datetime.timedelta(hours=9))
-    return datetime.datetime.now(jst).date()
 import io
 import re
 import pandas as pd
@@ -12,59 +8,6 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import openpyxl
-
-def commit_to_github(file_path, commit_message="Update database from Streamlit App"):
-    try:
-        if "GITHUB_TOKEN" not in st.secrets or "GITHUB_REPO" not in st.secrets:
-            return False, "Secrets (GITHUB_TOKEN / GITHUB_REPO) が設定されていません。"
-        
-        token = st.secrets["GITHUB_TOKEN"]
-        repo = st.secrets["GITHUB_REPO"]
-        
-        # Determine relative filename on repo
-        rel_filename = os.path.basename(file_path)
-        
-        import base64, json, urllib.request, urllib.error
-        
-        with open(file_path, "rb") as f:
-            content_bytes = f.read()
-        content_b64 = base64.b64encode(content_bytes).decode("utf-8")
-        
-        url = f"https://api.github.com/repos/{repo}/contents/{rel_filename}"
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "Streamlit-App"
-        }
-        
-        # Get current sha if file exists
-        sha = None
-        try:
-            req = urllib.request.Request(url, headers=headers, method="GET")
-            with urllib.request.urlopen(req) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                sha = data.get("sha")
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                return False, f"GitHub API error: {e}"
-        
-        payload = {
-            "message": commit_message,
-            "content": content_b64
-        }
-        if sha:
-            payload["sha"] = sha
-            
-        req_data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=req_data, headers=headers, method="PUT")
-        with urllib.request.urlopen(req) as resp:
-            if resp.status in [200, 201]:
-                return True, "GitHubへの自動同期に成功しました！"
-            else:
-                return False, f"GitHub API status: {resp.status}"
-    except Exception as ex:
-        return False, f"GitHub自動同期エラー: {str(ex)}"
-
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -273,22 +216,98 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
     return calc_updates
 
 
+
+import urllib.request
+import urllib.error
+import json
+import base64
+
+def sync_to_github(db_path, commit_message="Update DB via Streamlit App"):
+    """Sync local DB file to GitHub repository via REST API if Secrets are configured."""
+    github_token = None
+    github_repo = None
+    
+    try:
+        if hasattr(st, "secrets"):
+            github_token = st.secrets.get("GITHUB_TOKEN", None)
+            github_repo = st.secrets.get("GITHUB_REPO", None)
+    except Exception:
+        pass
+        
+    if not github_token or not github_repo:
+        return False, "GitHub Secrets (GITHUB_TOKEN / GITHUB_REPO) 未設定"
+        
+    try:
+        repo_clean = github_repo.strip().replace("https://github.com/", "").strip("/")
+        file_name = os.path.basename(db_path)
+        api_url = f"https://api.github.com/repos/{repo_clean}/contents/{file_name}"
+        
+        headers = {
+            "Authorization": f"Bearer {github_token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "StreamlitWastewaterApp"
+        }
+        
+        # 1. Get current SHA if exists
+        sha = None
+        req_get = urllib.request.Request(api_url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req_get, timeout=10) as resp:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                sha = res_data.get("sha")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                sha = None
+            else:
+                return False, f"GitHub API エラー ({e.code}): リポジトリ名またはアクセス権限をご確認ください。"
+        except Exception as e:
+            return False, f"GitHub接続エラー: {str(e)}"
+            
+        # 2. Read local file and base64 encode
+        if not os.path.exists(db_path):
+            return False, f"ローカルDBファイルが見つかりません: {db_path}"
+            
+        with open(db_path, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode("utf-8")
+            
+        payload = {
+            "message": commit_message,
+            "content": content_b64
+        }
+        if sha:
+            payload["sha"] = sha
+            
+        json_data = json.dumps(payload).encode("utf-8")
+        req_put = urllib.request.Request(api_url, data=json_data, headers=headers, method="PUT")
+        
+        with urllib.request.urlopen(req_put, timeout=15) as resp:
+            if resp.status in [200, 201]:
+                return True, "成功"
+            else:
+                return False, f"HTTP ステータス: {resp.status}"
+                
+    except Exception as e:
+        return False, f"自動同期中に例外が発生しました: {str(e)}"
+
+
 # DBファイルパスの取得
 DB_FILENAME_V2 = "wastewater-appsheet-db-v2.xlsx"
 DB_FILENAME_V1 = "wastewater-appsheet-db.xlsx"
 
 @st.cache_data(ttl=1)
-
 def get_db_path():
-    # Priority: current directory -> /workspace/artifacts/ -> fallback
-    if os.path.exists("wastewater-appsheet-db-v2.xlsx"):
-        return "wastewater-appsheet-db-v2.xlsx"
-    if os.path.exists("/workspace/artifacts/wastewater-appsheet-db-v2.xlsx"):
-        return "/workspace/artifacts/wastewater-appsheet-db-v2.xlsx"
-    if os.path.exists("wastewater-appsheet-db.xlsx"):
-        return "wastewater-appsheet-db.xlsx"
-    return "/workspace/artifacts/wastewater-appsheet-db.xlsx"
+    if os.path.exists(DB_FILENAME_V2):
+        return DB_FILENAME_V2
+    elif os.path.exists(DB_FILENAME_V1):
+        return DB_FILENAME_V1
+    else:
+        v2_abs = "/workspace/artifacts/wastewater-appsheet-db-v2.xlsx"
+        v1_abs = "/workspace/artifacts/wastewater-appsheet-db.xlsx"
+        if os.path.exists(v2_abs):
+            return v2_abs
+        return v1_abs
 
+db_path = get_db_path()
 
 # ==========================================
 # 2. データ読み込み ＆ キャッシュ処理 (パーセント・不等号クレンジング強化)
@@ -332,7 +351,6 @@ def load_all_data(path):
     
     return df_site, df_loc, df_item, df_rep, df_rec
 
-db_path = get_db_path()
 df_site, df_loc, df_item, df_rep, df_rec = load_all_data(db_path)
 
 if df_site is None:
@@ -379,13 +397,16 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # TAB 1: 点検データ入力 (要件①〜④) + 異常値チェック
 # ------------------------------------------
 with tab1:
+    if "save_success_msg" in st.session_state:
+        st.success(st.session_state["save_success_msg"])
+        del st.session_state["save_success_msg"]
     st.markdown("<div class='sub-header'>📝 点検結果の新規入力 ＆ 蓄積 (過去データとの異常値チェック機能付き)</div>", unsafe_allow_html=True)
     
     col_input1, col_input2 = st.columns(2)
     
     with col_input1:
         # ③ 日付の選択 (原則当日、変更可)
-        input_date = st.date_input("③ 点検日を選択", value=get_jst_today(), key="input_date_key")
+        input_date = st.date_input("③ 点検日を選択", datetime.date.today())
         input_date_str = input_date.strftime("%Y/%m/%d")
         
     with col_input2:
@@ -547,19 +568,17 @@ with tab1:
                             new_rec_id = f"REC{max_rec_num:06d}"
                             ws_rec.append([new_rec_id, target_rep_id, item_id, str(val).strip()])
                             
-                    
                     wb.save(db_path)
                     st.cache_data.clear()
                     
-                    # GitHub Commit
-                    gh_ok, gh_msg = commit_to_github(db_path, f"Auto-update: {input_date_str} {loc_options[selected_loc_id]}")
-                    if gh_ok:
-                        st.success(f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました！（GitHubへの自動同期も成功）")
+                    synced, sync_msg = sync_to_github(db_path, f"Data update: {input_date_str} {loc_options[selected_loc_id]}")
+                    if synced:
+                        st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを保存しました（GitHubへの自動同期も成功しました）"
                     else:
-                        st.success(f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました！（※GitHub自動同期: {gh_msg}）")
-
-                    st.cache_data.clear()
-                    
+                        if "未設定" in sync_msg:
+                            st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました！"
+                        else:
+                            st.session_state["save_success_msg"] = f"⚠️ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データをローカル保存しました。（GitHub同期エラー: {sync_msg}）"
                     st.rerun()
 
 # ------------------------------------------
