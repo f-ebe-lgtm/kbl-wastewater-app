@@ -5,7 +5,6 @@ import re
 import pandas as pd
 import numpy as np
 import streamlit as st
-import streamlit.components.v1 as components
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import openpyxl
@@ -139,22 +138,14 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
                 pass
         return None
 
-    def find_item(df_scope, name_prefix):
-        if df_scope.empty:
-            return df_scope
-        match = df_scope[df_scope['Item_Name'] == name_prefix]
-        if match.empty:
-            match = df_scope[df_scope['Item_Name'].str.startswith(name_prefix, na=False)]
-        return match
-
     # 1. 有機割合 [%] (MLVSS/MLSS*100) & 無機割合 [%] (100 - 有機割合)
     locs_in_site = df_loc_all[df_loc_all['Site_ID'] == selected_site_id]['Loc_ID'].unique()
     for loc_id in locs_in_site:
         loc_items = df_item_all[(df_item_all['Loc_ID'] == loc_id) & (df_item_all['Sheet_Type'] == selected_sheet_type)]
-        mlss_item = find_item(loc_items, 'MLSS')
-        mlvss_item = find_item(loc_items, 'MLVSS')
-        org_item = find_item(loc_items, '有機割合')
-        inorg_item = find_item(loc_items, '無機割合')
+        mlss_item = loc_items[loc_items['Item_Name'].isin(['MLSS', 'MLSS(簡)'])]
+        mlvss_item = loc_items[loc_items['Item_Name'] == 'MLVSS']
+        org_item = loc_items[loc_items['Item_Name'] == '有機割合']
+        inorg_item = loc_items[loc_items['Item_Name'] == '無機割合']
         
         if not mlss_item.empty and not mlvss_item.empty:
             mlss_v = _parse_val(mlss_item.iloc[0]['Item_ID'])
@@ -172,13 +163,13 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         site_items = df_item_all.merge(df_loc_all[df_loc_all['Site_ID'] == selected_site_id], on='Loc_ID')
         site_items = site_items[site_items['Sheet_Type'] == '点検管理表']
         
-        isou_item = find_item(site_items, '移送量')
-        hensou_item = find_item(site_items, '返送量')
+        isou_item = site_items[site_items['Item_Name'] == '移送量']
+        hensou_item = site_items[site_items['Item_Name'] == '返送量']
         
         aeration_end = site_items[site_items['Loc_Name'] == '曝気槽（末端側）']
-        mlss_item = find_item(aeration_end, 'MLSS')
-        temp_item = find_item(aeration_end, '水温')
-        sv30_item = find_item(aeration_end, 'SV30')
+        mlss_item = aeration_end[aeration_end['Item_Name'].isin(['MLSS', 'MLSS(簡)'])]
+        temp_item = aeration_end[aeration_end['Item_Name'] == '水温']
+        sv30_item = aeration_end[aeration_end['Item_Name'] == 'SV30']
         
         isou_v = _parse_val(isou_item.iloc[0]['Item_ID']) if not isou_item.empty else None
         hensou_v = _parse_val(hensou_item.iloc[0]['Item_ID']) if not hensou_item.empty else None
@@ -186,8 +177,8 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         temp_v = _parse_val(temp_item.iloc[0]['Item_ID']) if not temp_item.empty else None
         sv30_v = _parse_val(sv30_item.iloc[0]['Item_ID']) if not sv30_item.empty else None
         
-        load_item = find_item(site_items, '水面積負荷')
-        return_ratio_item = find_item(site_items, '返送率')
+        load_item = site_items[site_items['Item_Name'] == '水面積負荷']
+        return_ratio_item = site_items[site_items['Item_Name'] == '返送率']
         settling_item = site_items[site_items['Item_Name'] == '沈降速度']
         ratio_item = site_items[site_items['Item_Name'] == '沈降速度/水面積負荷']
         
@@ -224,12 +215,15 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
                 
     return calc_updates
 
+
 # DBファイルパスの取得
 def get_db_path():
-    if os.path.exists(DB_FILENAME_V2):
-        return DB_FILENAME_V2
-    elif os.path.exists(DB_FILENAME_V1):
-        return DB_FILENAME_V1
+    db_v2 = "wastewater-appsheet-db-v2.xlsx"
+    db_v1 = "wastewater-appsheet-db.xlsx"
+    if os.path.exists(db_v2):
+        return db_v2
+    elif os.path.exists(db_v1):
+        return db_v1
     else:
         v2_abs = "/workspace/artifacts/wastewater-appsheet-db-v2.xlsx"
         v1_abs = "/workspace/artifacts/wastewater-appsheet-db.xlsx"
@@ -287,27 +281,6 @@ if df_site is None:
     st.stop()
 
 # タイトル表示
-
-# スマホ入力用：テンキー（数字キーボード）自動呼び出し機能
-components.html("""
-<script>
-function setNumericInputMode() {
-    try {
-        const pDoc = window.parent.document;
-        const inputs = pDoc.querySelectorAll('input[type="text"]');
-        inputs.forEach(input => {
-            if (!input.id.includes('login') && !input.getAttribute('inputmode')) {
-                input.setAttribute('inputmode', 'decimal');
-            }
-        });
-    } catch(e) {}
-}
-setNumericInputMode();
-const observer = new MutationObserver(setNumericInputMode);
-observer.observe(window.parent.document.body, { childList: true, subtree: true });
-</script>
-""", height=0, width=0)
-
 st.markdown("<div class='main-header'>🌱 排水処理点検・水質データ管理システム (KBL Management App)</div>", unsafe_allow_html=True)
 
 # サイドバー：グローバル選択ヘッダー
