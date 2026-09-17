@@ -5,6 +5,7 @@ import re
 import pandas as pd
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import openpyxl
@@ -138,14 +139,26 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
                 pass
         return None
 
+    def _find_items(df_subset, name_query):
+        exact = df_subset[df_subset['Item_Name'] == name_query]
+        if not exact.empty:
+            return exact
+        prefix = df_subset[df_subset['Item_Name'].astype(str).str.startswith(name_query)]
+        if not prefix.empty:
+            return prefix
+        contains = df_subset[df_subset['Item_Name'].astype(str).str.contains(name_query, regex=False)]
+        return contains
+
     # 1. 有機割合 [%] (MLVSS/MLSS*100) & 無機割合 [%] (100 - 有機割合)
     locs_in_site = df_loc_all[df_loc_all['Site_ID'] == selected_site_id]['Loc_ID'].unique()
     for loc_id in locs_in_site:
         loc_items = df_item_all[(df_item_all['Loc_ID'] == loc_id) & (df_item_all['Sheet_Type'] == selected_sheet_type)]
-        mlss_item = loc_items[loc_items['Item_Name'].isin(['MLSS', 'MLSS(簡)'])]
-        mlvss_item = loc_items[loc_items['Item_Name'] == 'MLVSS']
-        org_item = loc_items[loc_items['Item_Name'] == '有機割合']
-        inorg_item = loc_items[loc_items['Item_Name'] == '無機割合']
+        mlss_item = _find_items(loc_items, 'MLSS')
+        if mlss_item.empty:
+            mlss_item = _find_items(loc_items, 'MLSS(簡)')
+        mlvss_item = _find_items(loc_items, 'MLVSS')
+        org_item = _find_items(loc_items, '有機割合')
+        inorg_item = _find_items(loc_items, '無機割合')
         
         if not mlss_item.empty and not mlvss_item.empty:
             mlss_v = _parse_val(mlss_item.iloc[0]['Item_ID'])
@@ -163,13 +176,13 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         site_items = df_item_all.merge(df_loc_all[df_loc_all['Site_ID'] == selected_site_id], on='Loc_ID')
         site_items = site_items[site_items['Sheet_Type'] == '点検管理表']
         
-        isou_item = site_items[site_items['Item_Name'] == '移送量']
-        hensou_item = site_items[site_items['Item_Name'] == '返送量']
+        isou_item = _find_items(site_items, '移送量')
+        hensou_item = _find_items(site_items, '返送量')
         
         aeration_end = site_items[site_items['Loc_Name'] == '曝気槽（末端側）']
-        mlss_item = aeration_end[aeration_end['Item_Name'].isin(['MLSS', 'MLSS(簡)'])]
-        temp_item = aeration_end[aeration_end['Item_Name'] == '水温']
-        sv30_item = aeration_end[aeration_end['Item_Name'] == 'SV30']
+        mlss_item = _find_items(aeration_end, 'MLSS')
+        temp_item = _find_items(aeration_end, '水温')
+        sv30_item = _find_items(aeration_end, 'SV30')
         
         isou_v = _parse_val(isou_item.iloc[0]['Item_ID']) if not isou_item.empty else None
         hensou_v = _parse_val(hensou_item.iloc[0]['Item_ID']) if not hensou_item.empty else None
@@ -177,10 +190,15 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         temp_v = _parse_val(temp_item.iloc[0]['Item_ID']) if not temp_item.empty else None
         sv30_v = _parse_val(sv30_item.iloc[0]['Item_ID']) if not sv30_item.empty else None
         
-        load_item = site_items[site_items['Item_Name'] == '水面積負荷']
-        return_ratio_item = site_items[site_items['Item_Name'] == '返送率']
-        settling_item = site_items[site_items['Item_Name'] == '沈降速度']
+        load_item = _find_items(site_items, '水面積負荷')
+        return_ratio_item = _find_items(site_items, '返送率')
+        settling_item = _find_items(site_items, '沈降速度')
         ratio_item = site_items[site_items['Item_Name'] == '沈降速度/水面積負荷']
+        if ratio_item.empty:
+            ratio_item = _find_items(site_items, '沈降速度/水面積負荷')
+            
+        if not settling_item.empty:
+            settling_item = settling_item[~settling_item['Item_Name'].astype(str).str.contains('水面積負荷')]
         
         # 水面積負荷 = 移送量 / 143
         surf_load = None
@@ -214,25 +232,21 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
                 calc_updates[ratio_item.iloc[0]['Item_ID']] = str(ratio_val)
                 
     return calc_updates
-
-
-# DBファイルパスの取得
-DB_FILENAME_V2 = "wastewater-appsheet-db-v2.xlsx"
-DB_FILENAME_V1 = "wastewater-appsheet-db.xlsx"
-
+# DBファイルパスの取得 (Streamlit Cloud & ローカル完全対応)
 @st.cache_data(ttl=1)
 def get_db_path():
-    if os.path.exists(DB_FILENAME_V2):
-        return DB_FILENAME_V2
-    elif os.path.exists(DB_FILENAME_V1):
-        return DB_FILENAME_V1
-    else:
-        v2_abs = "/workspace/artifacts/wastewater-appsheet-db-v2.xlsx"
-        v1_abs = "/workspace/artifacts/wastewater-appsheet-db.xlsx"
-        if os.path.exists(v2_abs):
-            return v2_abs
-        return v1_abs
-
+    candidates = [
+        "wastewater-appsheet-db-v3.xlsx",
+        "wastewater-appsheet-db-v2.xlsx",
+        "wastewater-appsheet-db.xlsx",
+        "/workspace/artifacts/wastewater-appsheet-db-v3.xlsx",
+        "/workspace/artifacts/wastewater-appsheet-db-v2.xlsx",
+        "/workspace/artifacts/wastewater-appsheet-db.xlsx"
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return "wastewater-appsheet-db-v3.xlsx"
 db_path = get_db_path()
 
 # ==========================================
@@ -475,6 +489,19 @@ with tab1:
                             if item_id in stats_by_item:
                                 st_info = stats_by_item[item_id]
                                 st.caption(f"💡 過去平均: {st_info['mean']:.2f} (目安: {st_info['lower']:.1f} 〜 {st_info['upper']:.1f})")
+
+                components.html("""
+            <script>
+            function setInputMode() {
+                const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+                inputs.forEach(input => {
+                    input.setAttribute('inputmode', 'decimal');
+                });
+            }
+            setTimeout(setInputMode, 300);
+            setTimeout(setInputMode, 1000);
+            </script>
+            """, height=0, width=0)
 
                 notes_input = st.text_area("備考 (Notes)", value=existing_rep.iloc[0]["Notes"] if not existing_rep.empty and pd.notna(existing_rep.iloc[0]["Notes"]) else "")
                 
@@ -905,36 +932,22 @@ with tab3:
             
         df_raw = pd.DataFrame(data_rows)
         
-        # 出力対象年の選択ドロップダウン (デフォルト: 全データ)
-        available_years = sorted(reports["Date_dt"].dt.year.dropna().unique().astype(int).tolist(), reverse=True)
-        year_options = ["全データ"] + [f"{y}年" for y in available_years]
-        
-        selected_year_opt = st.selectbox("📅 出力対象年を選択", options=year_options, index=0)
-        
-        if selected_year_opt == "全データ":
-            df_export = df_raw.copy()
-            file_year_str = "全データ"
-        else:
-            sel_y = int(selected_year_opt.replace("年", ""))
-            df_export = df_raw[pd.to_datetime(df_raw["Date"], errors="coerce").dt.year == sel_y].copy()
-            file_year_str = f"{sel_y}年"
-        
         mi_cols = [("基本情報", "日付")] + [(loc_name, item_name) for _, loc_name, item_name in col_defs] + [("基本情報", "備考")]
         raw_col_keys = ["Date"] + [item_id for item_id, _, _ in col_defs] + ["Notes"]
         
-        df_preview = df_export[raw_col_keys].copy()
+        df_preview = df_raw[raw_col_keys].copy()
         df_preview.columns = pd.MultiIndex.from_tuples(mi_cols)
         
-        st.markdown(f"##### プレビュー ({selected_year_opt} - 2段ヘッダー構造)")
-        st.dataframe(df_preview.tail(10) if len(df_preview) > 10 else df_preview, use_container_width=True)
+        st.markdown("##### プレビュー (最新10件 - 2段ヘッダー構造)")
+        st.dataframe(df_preview.tail(10), use_container_width=True)
         
-        def generate_formatted_excel(selected_site_id, selected_sheet_type, site_name, df_data):
+        def generate_formatted_excel(selected_site_id, selected_sheet_type, site_name):
             output = io.BytesIO()
             wb = openpyxl.Workbook()
             ws = wb.active
             ws.title = f"{selected_sheet_type}_集計"
             
-            ws.append([f"◆ {site_name} 【{selected_sheet_type}】 {selected_year_opt} 点検データ一覧表"])
+            ws.append([f"◆ {site_name} 【{selected_sheet_type}】 全点検データ一覧表"])
             ws.append([f"出力日時: {datetime.datetime.now().strftime('%Y/%m/%d %H:%M')}"])
             ws.append([])
             
@@ -944,7 +957,7 @@ with tab3:
             ws.append(header1)
             ws.append(header2)
             
-            for _, r in df_data.iterrows():
+            for _, r in df_raw.iterrows():
                 row_arr = [r["Date"]] + [r[item_id] for item_id, _, _ in col_defs] + [r["Notes"]]
                 ws.append(row_arr)
                 
@@ -1006,12 +1019,12 @@ with tab3:
             output.seek(0)
             return output
             
-        excel_bytes = generate_formatted_excel(selected_site_id, selected_sheet_type, site_options[selected_site_id], df_export)
+        excel_bytes = generate_formatted_excel(selected_site_id, selected_sheet_type, site_options[selected_site_id])
         
         st.download_button(
-            label=f"📥 【{selected_year_opt}】原本仕様エクセル帳票 (.xlsx) をダウンロードする",
+            label="📥 原本と同仕様のExcelデータ (.xlsx) をダウンロードする",
             data=excel_bytes,
-            file_name=f"{site_options[selected_site_id]}_{selected_sheet_type}_{file_year_str}.xlsx",
+            file_name=f"{site_options[selected_site_id]}_{selected_sheet_type}_全データ.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
