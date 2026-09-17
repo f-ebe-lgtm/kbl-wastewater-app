@@ -117,10 +117,10 @@ if not st.session_state["authenticated"]:
 # GitHub REST API 自動同期関数
 # ------------------------------------------
 def sync_to_github_api(file_path):
-    """Syncs local Excel DB to GitHub repository using GitHub REST API and st.secrets['GITHUB_TOKEN']"""
+    """Syncs local file to GitHub repository using GitHub REST API and st.secrets['GITHUB_TOKEN']"""
     try:
         if "GITHUB_TOKEN" not in st.secrets:
-            return False, "GITHUB_TOKEN is not configured in Secrets"
+            return False, "GITHUB_TOKEN is not set in st.secrets"
         
         token = st.secrets["GITHUB_TOKEN"]
         repo = st.secrets.get("GITHUB_REPO", "kbl-wastewater-app")
@@ -168,12 +168,12 @@ def sync_to_github_api(file_path):
         return False, str(ex)
 
 # ------------------------------------------
-# 自動計算関数 (SVI, BOD除去率, 有機割合, 無機割合, 沈降速度, 水面積負荷, 返送率など)
+# 自動計算関数 (有機割合、無機割合、沈降速度、水面積負荷、返送率、SVI、BOD除去率)
 # ------------------------------------------
 def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_sheet_type, form_data_dict, df_rec_latest, target_rep_id):
     calc_updates = {}
     
-    def _parse_val(item_id):
+    def _parse_num(item_id):
         if item_id in form_data_dict:
             v_str = str(form_data_dict[item_id]).replace(',', '').replace('%', '').replace('<', '').replace('>', '').strip()
             try:
@@ -189,12 +189,12 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
                 pass
         return None
 
-    def _get_raw_str(item_id):
+    def _get_raw_val(item_id):
         if item_id in form_data_dict:
-            return str(form_data_dict[item_id])
+            return str(form_data_dict[item_id]).strip()
         match = df_rec_latest[(df_rec_latest['Report_ID'] == target_rep_id) & (df_rec_latest['Item_ID'] == item_id)]
         if not match.empty:
-            return str(match.iloc[0]['Value'])
+            return str(match.iloc[0]['Value']).strip()
         return ""
 
     def _find_items(df_subset, query_str):
@@ -219,8 +219,8 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         inorg_item = _find_items(loc_items, '無機割合')
         
         if not mlss_item.empty and not mlvss_item.empty:
-            mlss_v = _parse_val(mlss_item.iloc[0]['Item_ID'])
-            mlvss_v = _parse_val(mlvss_item.iloc[0]['Item_ID'])
+            mlss_v = _parse_num(mlss_item.iloc[0]['Item_ID'])
+            mlvss_v = _parse_num(mlvss_item.iloc[0]['Item_ID'])
             if mlss_v and mlss_v > 0 and mlvss_v is not None:
                 org_ratio = round((mlvss_v / mlss_v) * 100.0, 1)
                 inorg_ratio = round(100.0 - org_ratio, 1)
@@ -229,49 +229,7 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
                 if not inorg_item.empty:
                     calc_updates[inorg_item.iloc[0]['Item_ID']] = f"{inorg_ratio}%"
 
-    # 2. SVI Calculation (SVI = SV30 * 10000 / MLSS)
-    if selected_sheet_type == '点検管理表':
-        svi_mapping = [
-            ('S001', 'I0028', 'I0027', 'I0231'), # Kikkoman: SV30(I0028), MLSS(I0027) -> SVI(I0231)
-            ('S002', 'I0075', 'I0074', 'I0232'), # Mitsuboshi: SV30(I0075), MLSS(I0074) -> SVI(I0232)
-            ('S004', 'I0137', 'I0136', 'I0233'), # Canpack Keisetsu: SV30(I0137), MLSS(I0136) -> SVI(I0233)
-            ('S005', 'I0204', 'I0203', 'I0234'), # Canpack Shinsetsu: SV30(I0204), MLSS(I0203) -> SVI(I0234)
-        ]
-        for map_site, sv30_id, mlss_id, svi_id in svi_mapping:
-            if selected_site_id == map_site:
-                sv30_v = _parse_val(sv30_id)
-                mlss_v = _parse_val(mlss_id)
-                if sv30_v is not None and sv30_v > 0 and mlss_v is not None and mlss_v > 0:
-                    svi_val = round((sv30_v * 10000.0) / mlss_v, 1)
-                    calc_updates[svi_id] = str(svi_val)
-
-    # 3. BOD除去率 Calculation ( (原水BOD - 処理水BOD) / 原水BOD * 100 )
-    if selected_sheet_type == '計量証明':
-        bod_mapping = [
-            ('S001', 'I0049', 'I0054', 'I0235'), # Kikkoman: 原水BOD(I0049), 処理水BOD(I0054) -> BOD除去率(I0235)
-            ('S002', 'I0090', 'I0108', 'I0236'), # Mitsuboshi: 原水BOD5(I0090), 処理水BOD5(I0108) -> BOD除去率(I0236)
-            ('S004', 'I0160', 'I0177', 'I0237'), # Canpack: 原水BOD5(I0160), 処理水BOD5(I0177) -> BOD除去率(I0237)
-        ]
-        for map_site, raw_bod_id, tr_bod_id, rem_id in bod_mapping:
-            if selected_site_id == map_site:
-                raw_bod_str = _get_raw_str(raw_bod_id)
-                tr_bod_str = _get_raw_str(tr_bod_id)
-                raw_bod_v = _parse_val(raw_bod_id)
-                tr_bod_v = _parse_val(tr_bod_id)
-
-                is_less = False
-                if tr_bod_str and ('未満' in tr_bod_str or '<' in tr_bod_str):
-                    is_less = True
-                if tr_bod_v is not None and tr_bod_v < 5.0:
-                    is_less = True
-                    tr_bod_v = 5.0
-
-                if raw_bod_v is not None and raw_bod_v > 0 and tr_bod_v is not None and tr_bod_v >= 0:
-                    rem_rate = round(((raw_bod_v - tr_bod_v) / raw_bod_v) * 100.0, 1)
-                    suffix = "以上" if is_less else ""
-                    calc_updates[rem_id] = f"{rem_rate}%{suffix}"
-
-    # 4. キャンパック（S004/S005）専用計算 (沈降速度, 水面積負荷, 沈降速度/水面積負荷, 返送率)
+    # 2. キャンパック（S004/S005）専用計算 (沈降速度, 水面積負荷, 沈降速度/水面積負荷, 返送率)
     if selected_site_id in ['S004', 'S005'] and selected_sheet_type == '点検管理表':
         site_items = df_item_all.merge(df_loc_all[df_loc_all['Site_ID'] == selected_site_id], on='Loc_ID')
         site_items = site_items[site_items['Sheet_Type'] == '点検管理表']
@@ -284,11 +242,11 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         temp_item = _find_items(aeration_end, '水温')
         sv30_item = _find_items(aeration_end, 'SV30')
         
-        isou_v = _parse_val(isou_item.iloc[0]['Item_ID']) if not isou_item.empty else None
-        hensou_v = _parse_val(hensou_item.iloc[0]['Item_ID']) if not hensou_item.empty else None
-        mlss_v = _parse_val(mlss_item.iloc[0]['Item_ID']) if not mlss_item.empty else None
-        temp_v = _parse_val(temp_item.iloc[0]['Item_ID']) if not temp_item.empty else None
-        sv30_v = _parse_val(sv30_item.iloc[0]['Item_ID']) if not sv30_item.empty else None
+        isou_v = _parse_num(isou_item.iloc[0]['Item_ID']) if not isou_item.empty else None
+        hensou_v = _parse_num(hensou_item.iloc[0]['Item_ID']) if not hensou_item.empty else None
+        mlss_v = _parse_num(mlss_item.iloc[0]['Item_ID']) if not mlss_item.empty else None
+        temp_v = _parse_num(temp_item.iloc[0]['Item_ID']) if not temp_item.empty else None
+        sv30_v = _parse_num(sv30_item.iloc[0]['Item_ID']) if not sv30_item.empty else None
         
         load_item = _find_items(site_items, '水面積負荷')
         return_ratio_item = _find_items(site_items, '返送率')
@@ -300,17 +258,20 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         if not settling_item.empty:
             settling_item = settling_item[~settling_item['Item_Name'].astype(str).str.contains('水面積負荷')]
         
+        # 水面積負荷 = 移送量 / 143
         surf_load = None
         if isou_v is not None and isou_v > 0:
             surf_load = round(isou_v / 143.0, 2)
             if not load_item.empty:
                 calc_updates[load_item.iloc[0]['Item_ID']] = str(surf_load)
                 
+        # 返送率 [%] = 返送量 / 移送量 * 100
         if isou_v is not None and isou_v > 0 and hensou_v is not None and hensou_v >= 0:
             r_ratio = round((hensou_v / isou_v) * 100.0, 1)
             if not return_ratio_item.empty:
                 calc_updates[return_ratio_item.iloc[0]['Item_ID']] = f"{r_ratio}%"
                 
+        # 沈降速度 [m/h]
         v_settling = None
         if mlss_v is not None and mlss_v > 0 and temp_v is not None and temp_v > 0 and sv30_v is not None and sv30_v > 0:
             try:
@@ -322,11 +283,55 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
             except Exception:
                 pass
                 
+        # 沈降速度 / 水面積負荷
         if v_settling is not None and surf_load is not None and surf_load > 0:
             ratio_val = round(v_settling / surf_load, 2)
             if not ratio_item.empty:
                 calc_updates[ratio_item.iloc[0]['Item_ID']] = str(ratio_val)
+
+    # 3. SVI Calculation: SV30 * 10000 / MLSS
+    sv30_mlss_map = {
+        'S001': ('I0028', 'I0027', 'I0231'),
+        'S002': ('I0075', 'I0074', 'I0232'),
+        'S004': ('I0137', 'I0136', 'I0233'),
+        'S005': ('I0204', 'I0203', 'I0234')
+    }
+    if selected_sheet_type == '点検管理表' and selected_site_id in sv30_mlss_map:
+        sv30_id, mlss_id, svi_id = sv30_mlss_map[selected_site_id]
+        sv30_v = _parse_num(sv30_id)
+        mlss_v = _parse_num(mlss_id)
+        if sv30_v is not None and sv30_v > 0 and mlss_v is not None and mlss_v > 0:
+            svi_val = round((sv30_v * 10000.0) / mlss_v, 1)
+            calc_updates[svi_id] = str(svi_val)
+
+    # 4. BOD除去率 Calculation: (原水BOD - 処理水BOD) / 原水BOD * 100
+    bod_rem_map = {
+        'S001': ('I0049', 'I0054', 'I0235'),
+        'S002': ('I0090', 'I0108', 'I0236'),
+        'S004': ('I0160', 'I0177', 'I0237')
+    }
+    if selected_sheet_type == '計量証明' and selected_site_id in bod_rem_map:
+        raw_bod_id, treated_bod_id, rem_item_id = bod_rem_map[selected_site_id]
+        raw_v = _parse_num(raw_bod_id)
+        treated_raw_str = _get_raw_val(treated_bod_id)
+        
+        if raw_v is not None and raw_v > 0 and treated_raw_str and treated_raw_str not in ['', '-', 'nan']:
+            is_less = ('未満' in treated_raw_str) or ('<' in treated_raw_str)
+            treated_clean = treated_raw_str.replace(',', '').replace('%', '').replace('<', '').replace('>', '').replace('未満', '').strip()
+            treated_v = None
+            try:
+                treated_v = float(treated_clean)
+            except ValueError:
+                pass
                 
+            if treated_v is not None:
+                if is_less or treated_v < 5.0:
+                    rem_rate = round((raw_v - 5.0) / raw_v * 100.0, 1)
+                    calc_updates[rem_item_id] = f"{rem_rate}%以上"
+                else:
+                    rem_rate = round((raw_v - treated_v) / raw_v * 100.0, 1)
+                    calc_updates[rem_item_id] = f"{rem_rate}%"
+
     return calc_updates
 
 # DBファイルパスの取得
@@ -401,7 +406,7 @@ sheet_type_options = ["点検管理表", "計量証明"]
 selected_sheet_type = st.sidebar.selectbox("② 管理シート種別を選択", options=sheet_type_options)
 
 st.sidebar.markdown("---")
-st.sidebar.info(f"📍 選択中現場: **{site_options[selected_site_id]}**\n📄 種別: **{selected_sheet_type}**")
+st.sidebar.info(f"📍 選択中現場: **{site_options[selected_site_id]}**\\n📄 種別: **{selected_sheet_type}**")
 
 # メインタイトル
 st.markdown(f"<div class='main-header'>🌱 KBL 排水処理統合管理システム - {site_options[selected_site_id]}</div>", unsafe_allow_html=True)
@@ -482,10 +487,10 @@ with tab1:
 
             st.info("💡 **自動計算項目（SVI・BOD除去率・有機割合・無機割合・水面積負荷・沈降速度・返送率など）** は、入力された基礎数値から保存時に**全自動計算されExcelデータベースへ直接格納**されます（入力ボックスは非表示としています）。")
             
-            calc_item_names = ['SVI', 'BOD除去率', '有機割合', '有機割合 (%)', '無機割合', '沈降速度', '水面積負荷', '沈降速度/水面積負荷', '返送率', '返送率 (%)']
+            calc_item_names = ['有機割合', '有機割合 (%)', '無機割合', '沈降速度', '水面積負荷', '沈降速度/水面積負荷', '返送率', '返送率 (%)', 'SVI', 'BOD除去率']
             input_items = loc_items[~loc_items['Item_Name'].isin(calc_item_names)].sort_values("Display_Order")
 
-            # スマホ用テンキー（inputmode="decimal"）自動適用 JavaScript (フォーム外で実行)
+            # スマホ用テンキー（inputmode="decimal"）自動適用 JavaScript (Form外部で安全に実行)
             components.html("""
             <script>
             function setInputMode() {
@@ -522,7 +527,13 @@ with tab1:
                                 curr_idx = opts.index(default_val) if default_val in opts else 0
                                 form_data[item_id] = st.selectbox(label_str, options=opts, index=curr_idx)
                             else:
-                                form_data[item_id] = st.text_input(label_str, value=str(default_val) if str(default_val) != "nan" else "")
+                                init_num = None
+                                if str(default_val) != "nan" and str(default_val).strip() not in ["", "-"]:
+                                    try:
+                                        init_num = float(str(default_val).replace(",", "").replace("%", "").replace("<", "").replace(">", "").strip())
+                                    except ValueError:
+                                        pass
+                                form_data[item_id] = st.number_input(label_str, value=init_num, step=None, format=None, key=f"num_{item_id}")
                                 if item_id in stats_by_item:
                                     st_info = stats_by_item[item_id]
                                     st.caption(f"💡 過去平均: {st_info['mean']:.2f} (目安: {st_info['lower']:.1f} 〜 {st_info['upper']:.1f})")
@@ -534,20 +545,21 @@ with tab1:
                 if submit_btn:
                     anomalies = []
                     for item_id, val in form_data.items():
-                        val_str = str(val).strip().replace(",", "").replace("%", "").replace("<", "").replace(">", "")
-                        if val_str and val_str not in ["-", "nan", "None"]:
-                            try:
-                                num_v = float(val_str)
-                                if item_id in stats_by_item:
-                                    st_info = stats_by_item[item_id]
-                                    if num_v < st_info['lower'] or num_v > st_info['upper']:
-                                        it_name = df_item[df_item["Item_ID"] == item_id].iloc[0]["Item_Name"]
-                                        anomalies.append(f"・**{it_name}**: 入力値 {num_v} (過去通常範囲: {st_info['lower']:.1f} 〜 {st_info['upper']:.1f} / 平均: {st_info['mean']:.2f})")
-                            except ValueError:
-                                pass
+                        if val is not None:
+                            val_str = str(val).strip().replace(",", "").replace("%", "").replace("<", "").replace(">", "")
+                            if val_str and val_str not in ["-", "nan", "None"]:
+                                try:
+                                    num_v = float(val_str)
+                                    if item_id in stats_by_item:
+                                        st_info = stats_by_item[item_id]
+                                        if num_v < st_info['lower'] or num_v > st_info['upper']:
+                                            it_name = df_item[df_item["Item_ID"] == item_id].iloc[0]["Item_Name"]
+                                            anomalies.append(f"・**{it_name}**: 入力値 {num_v} (過去通常範囲: {st_info['lower']:.1f} 〜 {st_info['upper']:.1f} / 平均: {st_info['mean']:.2f})")
+                                except ValueError:
+                                    pass
 
                     if anomalies:
-                        st.warning("⚠️ **【異常値・誤入力の可能性あり】**\n" + "\n".join(anomalies) + "\n\n※数値に問題が無ければ、データは正常に保存されます。")
+                        st.warning("⚠️ **【異常値・誤入力の可能性あり】**\\n" + "\\n".join(anomalies) + "\\n\\n※数値に問題が無ければ、データは正常に保存されます。")
 
                     wb = openpyxl.load_workbook(db_path)
                     ws_rep = wb["Daily Report"]
@@ -568,7 +580,7 @@ with tab1:
                     else:
                         max_rep_num = 0
                         for rid in df_rep_latest["Report_ID"].dropna():
-                            m = re.search(r"\d+", str(rid))
+                            m = re.search(r"\\d+", str(rid))
                             if m:
                                 max_rep_num = max(max_rep_num, int(m.group()))
                         target_rep_id = f"REP{max_rep_num+1:05d}"
@@ -578,7 +590,7 @@ with tab1:
 
                     max_rec_num = 0
                     for rcid in df_rec_latest["Rec_ID"].dropna():
-                        m = re.search(r"\d+", str(rcid))
+                        m = re.search(r"\\d+", str(rcid))
                         if m:
                             max_rec_num = max(max_rec_num, int(m.group()))
 
@@ -587,7 +599,7 @@ with tab1:
                     final_save_data.update(auto_calcs)
 
                     for item_id, val in final_save_data.items():
-                        if str(val).strip() in ["", "-", "nan", "None"]:
+                        if val is None or str(val).strip() in ["", "-", "nan", "None"]:
                             continue
                         if item_id in existing_item_ids:
                             for row in ws_rec.iter_rows(min_row=2):
@@ -601,17 +613,16 @@ with tab1:
 
                     wb.save(db_path)
                     st.cache_data.clear()
-
+                    
                     sync_ok, sync_msg = sync_to_github_api(db_path)
                     if sync_ok:
                         st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました（GitHubへの自動同期も成功しました）！"
                     else:
                         st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました（ローカル更新完了 / GitHub同期: {sync_msg}）"
-
                     st.rerun()
 
 # ------------------------------------------
-# TAB 2: 動的2軸・複数槽比較水質グラフ
+# TAB 2: 動的2軸・複数槽比較水質グラフ (要件⑤)
 # ------------------------------------------
 with tab2:
     st.markdown("<div class='sub-header'>📊 期間・複数槽(最大3箇所)・1軸/2軸の比較水質グラフ</div>", unsafe_allow_html=True)
@@ -780,7 +791,7 @@ with tab3:
 
         df_raw = pd.DataFrame(data_rows)
 
-        # 年選択ドロップダウン (デフォルト: 全データ)
+        # 出力対象年の選択ドロップダウン (デフォルト: 全データ)
         available_years = sorted(reports["Date_dt"].dt.year.dropna().unique().astype(int).tolist(), reverse=True)
         year_options = ["全データ"] + [f"{y}年" for y in available_years]
 
@@ -803,7 +814,7 @@ with tab3:
         st.markdown(f"##### プレビュー ({selected_year_opt} - 2段ヘッダー構造)")
         st.dataframe(df_preview.tail(10) if len(df_preview) > 10 else df_preview, use_container_width=True)
 
-        def generate_formatted_excel(selected_site_id, selected_sheet_type, site_name):
+        def generate_formatted_excel(selected_site_id, selected_sheet_type, site_name, df_data_source):
             output = io.BytesIO()
             wb = openpyxl.Workbook()
             ws = wb.active
@@ -817,7 +828,7 @@ with tab3:
             ws.append(header1)
             ws.append(header2)
 
-            for _, r in df_export.iterrows():
+            for _, r in df_data_source.iterrows():
                 row_arr = [r["Date"]] + [r[item_id] for item_id, _, _ in col_defs] + [r["Notes"]]
                 ws.append(row_arr)
 
@@ -885,9 +896,9 @@ with tab3:
             output.seek(0)
             return output
 
-        excel_data = generate_formatted_excel(selected_site_id, selected_sheet_type, site_options[selected_site_id])
+        excel_data = generate_formatted_excel(selected_site_id, selected_sheet_type, site_options[selected_site_id], df_export)
         st.download_button(
-            label=f"📥 【{site_options[selected_site_id]}】 原本仕様エクセル帳票を一括ダウンロード (.xlsx)",
+            label=f"📥 【{site_options[selected_site_id]}】 原本仕様エクセル帳票を一括ダウンロード ({file_year_str}.xlsx)",
             data=excel_data,
             file_name=f"{site_options[selected_site_id]}_{selected_sheet_type}_{file_year_str}_{datetime.date.today().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
