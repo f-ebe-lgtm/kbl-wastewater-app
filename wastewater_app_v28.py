@@ -5,6 +5,7 @@ import re
 import pandas as pd
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import openpyxl
@@ -100,13 +101,77 @@ if not st.session_state["authenticated"]:
     st.markdown("#### 🔑 パスワード認証")
     pwd_input = st.text_input("パスワード", type="password", key="login_pwd_key")
     correct_pwd = st.secrets.get("APP_PASSWORD", "kbl2026")
-    if pwd_input:
+    if st.button("ログイン"):
         if pwd_input == correct_pwd:
             st.session_state["authenticated"] = True
             st.rerun()
         elif pwd_input:
             st.error("❌ パスワードが正しくありません。")
     st.stop()
+
+
+# ==========================================
+# GitHub REST API による自動コミット・同期関数
+# ==========================================
+def sync_to_github_api(file_path):
+    """Syncs local file to GitHub repository using GitHub REST API and st.secrets["GITHUB_TOKEN"]"""
+    try:
+        if "GITHUB_TOKEN" not in st.secrets:
+            return False, "st.secrets に GITHUB_TOKEN が設定されていません"
+        
+        token = st.secrets["GITHUB_TOKEN"]
+        repo = st.secrets.get("GITHUB_REPO", "kbl-wastewater-app")
+        branch = st.secrets.get("GITHUB_BRANCH", "main")
+        
+        target_path = os.path.basename(file_path)
+        if not target_path.endswith('.xlsx'):
+            target_path = "wastewater-appsheet-db-v3.xlsx"
+            
+        import base64
+        import json
+        import urllib.request
+        import urllib.error
+        
+        url = f"https://api.github.com/repos/{repo}/contents/{target_path}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "StreamlitApp"
+        }
+        
+        # 1. Fetch current SHA
+        sha = None
+        req_get = urllib.request.Request(f"{url}?ref={branch}", headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req_get) as resp:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                sha = res_data.get("sha")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                return False, f"HTTP Error {e.code} (SHA取得失敗)"
+                
+        # 2. Read local file and encode base64
+        with open(file_path, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode("utf-8")
+            
+        now_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        payload = {
+            "message": f"Auto-update wastewater data via App [{now_str}]",
+            "content": content_b64,
+            "branch": branch
+        }
+        if sha:
+            payload["sha"] = sha
+            
+        data_json = json.dumps(payload).encode("utf-8")
+        req_put = urllib.request.Request(url, data=data_json, headers=headers, method="PUT")
+        
+        with urllib.request.urlopen(req_put) as resp:
+            if resp.status in [200, 201]:
+                return True, "成功"
+            return False, f"HTTP Status {resp.status}"
+    except Exception as ex:
+        return False, str(ex)
 
 
 # ==========================================
@@ -225,8 +290,7 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
                 
     return calc_updates
 
-# DBファイルパスの取得 (Streamlit Cloud & ローカル完全対応)
-@st.cache_data(ttl=1)
+# DBファイルパスの取得
 def get_db_path():
     candidates = [
         "wastewater-appsheet-db-v3.xlsx",
@@ -259,14 +323,12 @@ def load_all_data(path):
     df_rep = pd.read_excel(xls, "Daily Report")
     df_rec = pd.read_excel(xls, "Inspection Records")
     
-    # 旧DBファイル(北越コーポレーション/S003)が読まれても自動排除
     df_site = df_site[~df_site["Site_Name"].astype(str).str.contains("北越") & (df_site["Site_ID"] != "S003")]
     df_loc = df_loc[~df_loc["Site_ID"].isin(["S003"]) & df_loc["Site_ID"].isin(df_site["Site_ID"])]
     df_item = df_item[df_item["Loc_ID"].isin(df_loc["Loc_ID"])]
     df_rep = df_rep[df_rep["Site_ID"].isin(df_site["Site_ID"])]
     df_rec = df_rec[df_rec["Report_ID"].isin(df_rep["Report_ID"])]
 
-    # 型変換・整形
     df_rep["Date"] = pd.to_datetime(df_rep["Date"]).dt.strftime("%Y/%m/%d")
     
     val_str_series = df_rec["Value"].astype(str)
@@ -285,35 +347,43 @@ def load_all_data(path):
     
     return df_site, df_loc, df_item, df_rep, df_rec
 
-# ==========================================
-# 3. アプリメイン画面 & サイドバー設定 (全4現場完全切替)
-# ==========================================
 df_site, df_loc, df_item, df_rep, df_rec = load_all_data(db_path)
 
 if df_site is None:
     st.stop()
 
-# サイドバー設定 (ヘッダー配色も統一)
-st.sidebar.markdown("<h2 style='color:#2E7D32;'>⚙️ KBL 排水管理設定</h2>", unsafe_allow_html=True)
+def get_jst_today():
+    return (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=9)).date()
+
+st.markdown("<div class='main-header'>🌱 排水処理点検・水質データ管理システム (KBL Management App)</div>", unsafe_allow_html=True)
+
+st.sidebar.image("https://img.icons8.com/color/96/000000/sprout.png", width=64)
+st.sidebar.title("📌 対象設定")
 
 site_options = dict(zip(df_site["Site_ID"], df_site["Site_Name"]))
-selected_site_id = st.sidebar.selectbox("① 対象現場（工場）を選択", options=list(site_options.keys()), format_func=lambda x: site_options[x])
+selected_site_id = st.sidebar.selectbox(
+    "① 現場を選択",
+    options=list(site_options.keys()),
+    format_func=lambda x: site_options[x]
+)
 
-sheet_type_options = ["点検管理表", "計量証明"]
-selected_sheet_type = st.sidebar.selectbox("② 管理シート種別を選択", options=sheet_type_options)
+available_sheet_types = ["点検管理表", "計量証明"]
+
+selected_sheet_type = st.sidebar.radio(
+    "② シート種別を選択",
+    options=available_sheet_types,
+    horizontal=True
+)
 
 st.sidebar.markdown("---")
-st.sidebar.info(f"📍 選択中現場: **{site_options[selected_site_id]}**\n📄 種別: **{selected_sheet_type}**")
-
-# メインタイトル
-st.markdown(f"<div class='main-header'>🌱 KBL 排水処理統合管理システム - {site_options[selected_site_id]}</div>", unsafe_allow_html=True)
+st.sidebar.info(f"**選択中の現場**: {site_options[selected_site_id]}\n\n**シート**: {selected_sheet_type}")
 
 # ==========================================
-# 4. タブ構築
+# 3. メイン画面タブ構成
 # ==========================================
 tab1, tab2, tab3, tab4 = st.tabs([
-    "📝 点検データ入力・異常値チェック",
-    "📊 水質比較グラフ",
+    "📝 ①〜④ 点検データ入力",
+    "📊 ⑤ 動的2軸・複数槽比較水質グラフ",
     "📑 ⑥ エクセル帳票ダウンロード",
     "🗃️ データベース全件閲覧"
 ])
@@ -322,16 +392,16 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # TAB 1: 点検データ入力
 # ------------------------------------------
 with tab1:
-    st.markdown("<div class='sub-header'>📝 点検結果の新規入力 ＆ 蓄積 (過去データとの異常値チェック機能付き)</div>", unsafe_allow_html=True)
-    
     if "save_success_msg" in st.session_state:
         st.success(st.session_state["save_success_msg"])
         del st.session_state["save_success_msg"]
+        
+    st.markdown("<div class='sub-header'>📝 点検結果の新規入力 ＆ 蓄積 (過去データとの異常値チェック機能付き)</div>", unsafe_allow_html=True)
 
     col_input1, col_input2 = st.columns(2)
 
     with col_input1:
-        input_date = st.date_input("③ 点検日を選択", datetime.date.today())
+        input_date = st.date_input("③ 点検日を選択", value=get_jst_today(), key="input_date_key")
         input_date_str = input_date.strftime("%Y/%m/%d")
 
     with col_input2:
@@ -361,15 +431,18 @@ with tab1:
                 existing_values = dict(zip(rec_exist["Item_ID"], rec_exist["Value"]))
                 st.info(f"💡 {input_date_str} の既存データが読み込まれました。必要に応じて内容を更新してください。")
 
-            df_hist = df_rec[df_rec["Item_ID"].isin(loc_items["Item_ID"])].dropna(subset=["Value_Num"])
             stats_by_item = {}
-            for item_id_key, group in df_hist.groupby("Item_ID"):
-                vals = group["Value_Num"].values
+            rep_site_match = df_rep[(df_rep["Site_ID"] == selected_site_id) & (df_rep["Sheet_Type"] == selected_sheet_type)]
+            rec_site_match = df_rec[df_rec["Report_ID"].isin(rep_site_match["Report_ID"])]
+            
+            for item_id_key in loc_items["Item_ID"].unique():
+                item_recs = rec_site_match[rec_site_match["Item_ID"] == item_id_key]["Value_Num"].dropna()
+                vals = item_recs.values
                 if len(vals) >= 2:
-                    mean_v = np.mean(vals)
-                    std_v = np.std(vals)
-                    min_v = np.min(vals)
-                    max_v = np.max(vals)
+                    mean_v = float(np.mean(vals))
+                    std_v = float(np.std(vals))
+                    min_v = float(np.min(vals))
+                    max_v = float(np.max(vals))
                     lower_b = max(0, mean_v - 2.5 * std_v) if mean_v >= 0 else mean_v - 2.5 * std_v
                     upper_b = mean_v + 2.5 * std_v
                     stats_by_item[item_id_key] = {
@@ -387,7 +460,7 @@ with tab1:
             calc_item_names = ['有機割合', '有機割合 (%)', '無機割合', '沈降速度', '水面積負荷', '沈降速度/水面積負荷', '返送率', '返送率 (%)']
             input_items = loc_items[~loc_items['Item_Name'].isin(calc_item_names)].sort_values("Display_Order")
 
-            # スマホ用テンキー（inputmode="decimal"）自動適用 JavaScript
+            # スマホ用テンキー（inputmode="decimal"）自動適用 JavaScript (st.form の外に配置)
             components.html("""
             <script>
             function setInputMode() {
@@ -399,7 +472,7 @@ with tab1:
             setTimeout(setInputMode, 300);
             setTimeout(setInputMode, 1000);
             </script>
-            """, height=0)
+            """, height=0, width=0)
 
             with st.form("inspection_input_form"):
                 form_data = {}
@@ -504,7 +577,6 @@ with tab1:
                     wb.save(db_path)
                     st.cache_data.clear()
 
-                    # GitHub API 同期処理
                     sync_ok, sync_msg = sync_to_github_api(db_path)
                     if sync_ok:
                         st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました（GitHubへの自動同期も成功しました）！"
@@ -647,7 +719,7 @@ with tab2:
             st.caption("📸 グラフ右上のカメラアイコンをタップすると、グラフをPNG画像としてワンクリック保存できます。")
 
 # ------------------------------------------
-# TAB 3: エクセル帳票ダウンロード (要件⑥)
+# TAB 3: エクセル帳票ダウンロード
 # ------------------------------------------
 with tab3:
     st.markdown("<div class='sub-header'>📑 全点検データの一括エクセル化 (原本仕様2段ヘッダー帳票出力)</div>", unsafe_allow_html=True)
@@ -686,7 +758,6 @@ with tab3:
             
         df_raw = pd.DataFrame(data_rows)
         
-        # 出力対象年の選択ドロップダウン (デフォルト: 全データ)
         available_years = sorted(reports["Date_dt"].dt.year.dropna().unique().astype(int).tolist(), reverse=True)
         year_options = ["全データ"] + [f"{y}年" for y in available_years]
         
@@ -709,13 +780,13 @@ with tab3:
         st.markdown(f"##### プレビュー ({selected_year_opt} - 2段ヘッダー構造)")
         st.dataframe(df_preview.tail(10) if len(df_preview) > 10 else df_preview, use_container_width=True)
         
-        def generate_formatted_excel(selected_site_id, selected_sheet_type, site_name, df_data_export, file_year_label):
+        def generate_formatted_excel(selected_site_id, selected_sheet_type, site_name):
             output = io.BytesIO()
             wb = openpyxl.Workbook()
             ws = wb.active
             ws.title = f"{selected_sheet_type}_集計"
             
-            ws.append([f"◆ {site_name} 【{selected_sheet_type}】 {file_year_label} 点検データ一覧表"])
+            ws.append([f"◆ {site_name} 【{selected_sheet_type}】 {file_year_str} 点検データ一覧表"])
             ws.append([f"出力日時: {datetime.datetime.now().strftime('%Y/%m/%d %H:%M')}"])
             ws.append([])
             
@@ -725,7 +796,7 @@ with tab3:
             ws.append(header1)
             ws.append(header2)
             
-            for _, r in df_data_export.iterrows():
+            for _, r in df_export.iterrows():
                 row_arr = [r["Date"]] + [r[item_id] for item_id, _, _ in col_defs] + [r["Notes"]]
                 ws.append(row_arr)
                 
@@ -787,10 +858,10 @@ with tab3:
             output.seek(0)
             return output
             
-        excel_bytes = generate_formatted_excel(selected_site_id, selected_sheet_type, site_options[selected_site_id], df_export, file_year_str)
+        excel_bytes = generate_formatted_excel(selected_site_id, selected_sheet_type, site_options[selected_site_id])
         
         st.download_button(
-            label=f"📥 【{file_year_str}】 {site_options[selected_site_id]} 原本仕様エクセル帳票 (.xlsx) をダウンロード",
+            label=f"📥 【{file_year_str}】 原本と同仕様のExcelデータ (.xlsx) をダウンロードする",
             data=excel_bytes,
             file_name=f"{site_options[selected_site_id]}_{selected_sheet_type}_{file_year_str}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
