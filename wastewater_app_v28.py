@@ -486,29 +486,32 @@ with tab1:
 
             with st.form("inspection_input_form"):
                 form_data = {}
-                cols = st.columns(3)
+                input_items_list = list(input_items.iterrows())
 
-                for idx, (_, item) in enumerate(input_items.iterrows()):
-                    item_id = item["Item_ID"]
-                    item_name = item["Item_Name"]
-                    vtype = item["Value_Type"]
-                    unit = str(item["Unit_or_Options"]) if pd.notna(item["Unit_or_Options"]) else ""
+                for row_start in range(0, len(input_items_list), 3):
+                    row_chunk = input_items_list[row_start : row_start + 3]
+                    cols = st.columns(3)
+                    for c_idx, (_, item) in enumerate(row_chunk):
+                        item_id = item["Item_ID"]
+                        item_name = item["Item_Name"]
+                        vtype = item["Value_Type"]
+                        unit = str(item["Unit_or_Options"]) if pd.notna(item["Unit_or_Options"]) else ""
 
-                    default_val = existing_values.get(item_id, "")
+                        default_val = existing_values.get(item_id, "")
 
-                    label_str = item_name if vtype == "Enum" or not unit or unit == "nan" else f"{item_name} ({unit})"
-                    col_target = cols[idx % 3]
+                        label_str = item_name if vtype == "Enum" or not unit or unit == "nan" else f"{item_name} ({unit})"
+                        col_target = cols[c_idx]
 
-                    with col_target:
-                        if vtype == "Enum":
-                            opts = ["-", "無", "微少", "少", "中", "多"]
-                            curr_idx = opts.index(default_val) if default_val in opts else 0
-                            form_data[item_id] = st.selectbox(label_str, options=opts, index=curr_idx)
-                        else:
-                            form_data[item_id] = st.text_input(label_str, value=str(default_val) if str(default_val) != "nan" else "")
-                            if item_id in stats_by_item:
-                                st_info = stats_by_item[item_id]
-                                st.caption(f"💡 過去平均: {st_info['mean']:.2f} (目安: {st_info['lower']:.1f} 〜 {st_info['upper']:.1f})")
+                        with col_target:
+                            if vtype == "Enum":
+                                opts = ["-", "無", "微少", "少", "中", "多"]
+                                curr_idx = opts.index(default_val) if default_val in opts else 0
+                                form_data[item_id] = st.selectbox(label_str, options=opts, index=curr_idx)
+                            else:
+                                form_data[item_id] = st.text_input(label_str, value=str(default_val) if str(default_val) != "nan" else "")
+                                if item_id in stats_by_item:
+                                    st_info = stats_by_item[item_id]
+                                    st.caption(f"💡 過去平均: {st_info['mean']:.2f} (目安: {st_info['lower']:.1f} 〜 {st_info['upper']:.1f})")
 
                 notes_input = st.text_area("備考 (Notes)", value=existing_rep.iloc[0]["Notes"] if not existing_rep.empty and pd.notna(existing_rep.iloc[0]["Notes"]) else "")
 
