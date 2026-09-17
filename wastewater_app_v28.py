@@ -175,7 +175,7 @@ def sync_to_github_api(file_path):
 
 
 # ==========================================
-# 自動計算関数 (有機割合、無機割合、沈降速度、水面積負荷、返送率など)
+# 自動計算関数 (有機割合、無機割合、沈降速度、水面積負荷、返送率、SVI、BOD除去率)
 # ==========================================
 def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_sheet_type, form_data_dict, df_rec_latest, target_rep_id):
     calc_updates = {}
@@ -287,10 +287,55 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
             ratio_val = round(v_settling / surf_load, 2)
             if not ratio_item.empty:
                 calc_updates[ratio_item.iloc[0]['Item_ID']] = str(ratio_val)
-                
+
+    # 3. SVI 計算 (SV30 * 10000 / MLSS)
+    if selected_sheet_type == '点検管理表':
+        locs_in_site = df_loc_all[df_loc_all['Site_ID'] == selected_site_id]['Loc_ID'].unique()
+        for loc_id in locs_in_site:
+            loc_items = df_item_all[(df_item_all['Loc_ID'] == loc_id) & (df_item_all['Sheet_Type'] == selected_sheet_type)]
+            sv30_item = _find_items(loc_items, 'SV30')
+            mlss_item = _find_items(loc_items, 'MLSS')
+            if mlss_item.empty:
+                mlss_item = _find_items(loc_items, 'MLSS(簡)')
+            svi_item = _find_items(loc_items, 'SVI')
+            
+            if not sv30_item.empty and not mlss_item.empty and not svi_item.empty:
+                v_sv30 = _parse_val(sv30_item.iloc[0]['Item_ID'])
+                v_mlss = _parse_val(mlss_item.iloc[0]['Item_ID'])
+                if v_sv30 is not None and v_mlss is not None and v_mlss > 0:
+                    svi_calc = round((v_sv30 * 10000.0) / v_mlss, 1)
+                    calc_updates[svi_item.iloc[0]['Item_ID']] = str(svi_calc)
+
+    # 4. BOD除去率 計算 ((原水BOD - 処理水BOD) / 原水BOD * 100)
+    if selected_sheet_type == '計量証明':
+        site_items = df_item_all.merge(df_loc_all[df_loc_all['Site_ID'] == selected_site_id], on='Loc_ID')
+        site_items = site_items[site_items['Sheet_Type'] == '計量証明']
+        
+        raw_items = site_items[site_items['Loc_Name'].str.contains('原水')]
+        treated_items = site_items[site_items['Loc_Name'].str.contains('処理水')]
+        
+        raw_bod_item = _find_items(raw_items, 'BOD')
+        if raw_bod_item.empty:
+            raw_bod_item = _find_items(raw_items, 'BOD5')
+            
+        treated_bod_item = _find_items(treated_items, 'BOD')
+        if treated_bod_item.empty:
+            treated_bod_item = _find_items(treated_items, 'BOD5')
+            
+        bod_rem_item = _find_items(treated_items, 'BOD除去率')
+        
+        if not raw_bod_item.empty and not treated_bod_item.empty and not bod_rem_item.empty:
+            v_raw = _parse_val(raw_bod_item.iloc[0]['Item_ID'])
+            v_treated = _parse_val(treated_bod_item.iloc[0]['Item_ID'])
+            if v_raw is not None and v_treated is not None and v_raw > 0:
+                bod_rem_calc = round(((v_raw - v_treated) / v_raw) * 100.0, 1)
+                calc_updates[bod_rem_item.iloc[0]['Item_ID']] = f"{bod_rem_calc}%"
+
     return calc_updates
 
-# DBファイルパスの取得
+
+# DBファイルパスの取得 (Streamlit Cloud & ローカル完全対応)
+@st.cache_data(ttl=1)
 def get_db_path():
     candidates = [
         "wastewater-appsheet-db-v3.xlsx",
@@ -352,11 +397,14 @@ df_site, df_loc, df_item, df_rep, df_rec = load_all_data(db_path)
 if df_site is None:
     st.stop()
 
+# 日本時間 (JST) 当日日付取得
 def get_jst_today():
     return (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=9)).date()
 
+# タイトル表示
 st.markdown("<div class='main-header'>🌱 排水処理点検・水質データ管理システム (KBL Management App)</div>", unsafe_allow_html=True)
 
+# サイドバー：グローバル選択ヘッダー
 st.sidebar.image("https://img.icons8.com/color/96/000000/sprout.png", width=64)
 st.sidebar.title("📌 対象設定")
 
@@ -382,8 +430,8 @@ st.sidebar.info(f"**選択中の現場**: {site_options[selected_site_id]}\n\n**
 # 3. メイン画面タブ構成
 # ==========================================
 tab1, tab2, tab3, tab4 = st.tabs([
-    "📝 ①〜④ 点検データ入力",
-    "📊 ⑤ 動的2軸・複数槽比較水質グラフ",
+    "📝 ①〜④ 点検データ入力", 
+    "📊 ⑤ 動的2軸・複数槽比較水質グラフ", 
     "📑 ⑥ エクセル帳票ダウンロード",
     "🗃️ データベース全件閲覧"
 ])
@@ -455,12 +503,12 @@ with tab1:
                         "lower": vals[0]*0.5, "upper": vals[0]*1.5
                     }
 
-            st.info("💡 **自動計算項目（有機割合・無機割合・水面積負荷・沈降速度・返送率など）** は、入力された基礎数値から保存時に**全自動計算されExcelデータベースへ直接格納**されます（入力ボックスは非表示としています）。")
+            st.info("💡 **自動計算項目（有機割合・無機割合・水面積負荷・沈降速度・返送率・SVI・BOD除去率など）** は、入力された基礎数値から保存時に**全自動計算されExcelデータベースへ直接格納**されます（入力ボックスは非表示としています）。")
             
-            calc_item_names = ['有機割合', '有機割合 (%)', '無機割合', '沈降速度', '水面積負荷', '沈降速度/水面積負荷', '返送率', '返送率 (%)']
+            calc_item_names = ['有機割合', '有機割合 (%)', '無機割合', '沈降速度', '水面積負荷', '沈降速度/水面積負荷', '返送率', '返送率 (%)', 'SVI', 'BOD除去率', 'BOD除去率 (%)']
             input_items = loc_items[~loc_items['Item_Name'].isin(calc_item_names)].sort_values("Display_Order")
 
-            # スマホ用テンキー（inputmode="decimal"）自動適用 JavaScript (st.form の外に配置)
+            # スマホ用テンキー（inputmode="decimal"）自動適用 JavaScript (form外配置)
             components.html("""
             <script>
             function setInputMode() {
@@ -472,7 +520,7 @@ with tab1:
             setTimeout(setInputMode, 300);
             setTimeout(setInputMode, 1000);
             </script>
-            """, height=0, width=0)
+            """, height=0)
 
             with st.form("inspection_input_form"):
                 form_data = {}
@@ -577,6 +625,7 @@ with tab1:
                     wb.save(db_path)
                     st.cache_data.clear()
 
+                    # GitHub API 同期処理
                     sync_ok, sync_msg = sync_to_github_api(db_path)
                     if sync_ok:
                         st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました（GitHubへの自動同期も成功しました）！"
@@ -719,7 +768,7 @@ with tab2:
             st.caption("📸 グラフ右上のカメラアイコンをタップすると、グラフをPNG画像としてワンクリック保存できます。")
 
 # ------------------------------------------
-# TAB 3: エクセル帳票ダウンロード
+# TAB 3: エクセル帳票ダウンロード (要件⑥)
 # ------------------------------------------
 with tab3:
     st.markdown("<div class='sub-header'>📑 全点検データの一括エクセル化 (原本仕様2段ヘッダー帳票出力)</div>", unsafe_allow_html=True)
@@ -758,6 +807,7 @@ with tab3:
             
         df_raw = pd.DataFrame(data_rows)
         
+        # 出力対象年の選択ドロップダウン (デフォルト: 全データ)
         available_years = sorted(reports["Date_dt"].dt.year.dropna().unique().astype(int).tolist(), reverse=True)
         year_options = ["全データ"] + [f"{y}年" for y in available_years]
         
