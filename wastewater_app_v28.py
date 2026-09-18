@@ -5,6 +5,7 @@ import re
 import pandas as pd
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import openpyxl
@@ -90,7 +91,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1.5 簡易パスワード認証保護 (Security - Streamlit Cloud Safe)
+# 1.5 簡易パスワード認証保護 (Security)
 # ==========================================
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
@@ -101,23 +102,19 @@ if not st.session_state["authenticated"]:
     st.write("関係者専用のシステムです。パスワードを入力してログインしてください。")
     
     pwd_input = st.text_input("パスワード", type="password", key="login_pwd_key")
-    
-    correct_pwd = "kbl2026"
-    try:
-        if "PASSWORD" in st.secrets:
-            correct_pwd = st.secrets["PASSWORD"]
-        elif "APP_PASSWORD" in st.secrets:
-            correct_pwd = st.secrets["APP_PASSWORD"]
-    except Exception:
-        pass
-        
     if st.button("🔓 ログイン") or pwd_input:
+        try:
+            correct_pwd = st.secrets["PASSWORD"]
+        except Exception:
+            correct_pwd = "kbl2026"
+            
         if pwd_input == correct_pwd:
             st.session_state["authenticated"] = True
             st.rerun()
         elif pwd_input:
             st.error("❌ パスワードが正しくありません。")
     st.stop()
+
 
 
 # ==========================================
@@ -235,36 +232,40 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
                 calc_updates[ratio_item.iloc[0]['Item_ID']] = str(ratio_val)
                 
     return calc_updates
+# DBファイルパスの取得
+DB_FILENAME_V2 = "wastewater-appsheet-db-v2.xlsx"
+DB_FILENAME_V1 = "wastewater-appsheet-db.xlsx"
 
-# DBファイルパスの取得 (NameError防止・v3/v2/v1優先度制御)
+@st.cache_data(ttl=1)
 def get_db_path():
-    for fname in ["wastewater-appsheet-db-v3.xlsx", "wastewater-appsheet-db-v2.xlsx", "wastewater-appsheet-db.xlsx"]:
-        if os.path.exists(fname):
-            return fname
-        abs_p = f"/workspace/artifacts/{fname}"
-        if os.path.exists(abs_p):
-            return abs_p
-    return "wastewater-appsheet-db-v3.xlsx"
+    if os.path.exists(DB_FILENAME_V2):
+        return DB_FILENAME_V2
+    elif os.path.exists(DB_FILENAME_V1):
+        return DB_FILENAME_V1
+    else:
+        v2_abs = "/workspace/artifacts/wastewater-appsheet-db-v2.xlsx"
+        v1_abs = "/workspace/artifacts/wastewater-appsheet-db.xlsx"
+        if os.path.exists(v2_abs):
+            return v2_abs
+        return v1_abs
 
 db_path = get_db_path()
 
 # ==========================================
-# 2. データ読み込み ＆ キャッシュ処理
+# 2. データ読み込み ＆ キャッシュ処理 (パーセント・不等号クレンジング強化)
 # ==========================================
+@st.cache_data(ttl=1)
 def sync_to_github_api(file_path):
-    """Syncs local file to GitHub repository using GitHub REST API and st.secrets['GITHUB_TOKEN']"""
+    """Syncs local file to GitHub repository using GitHub REST API and st.secrets["GITHUB_TOKEN"]"""
     try:
         if "GITHUB_TOKEN" not in st.secrets:
-            return False, "GITHUB_TOKEN 未設定 (st.secrets)"
+            return False, "st.secrets に GITHUB_TOKEN が設定されていません"
         
         token = st.secrets["GITHUB_TOKEN"]
         repo = st.secrets.get("GITHUB_REPO", "kbl-wastewater-app")
         branch = st.secrets.get("GITHUB_BRANCH", "main")
-        
         target_path = os.path.basename(file_path)
-        if not target_path.endswith('.xlsx'):
-            target_path = "wastewater-appsheet-db-v3.xlsx"
-            
+        
         import base64
         import json
         import urllib.request
@@ -277,6 +278,7 @@ def sync_to_github_api(file_path):
             "User-Agent": "StreamlitApp"
         }
         
+        # 1. Get current file SHA
         sha = None
         req_get = urllib.request.Request(f"{url}?ref={branch}", headers=headers, method="GET")
         try:
@@ -285,14 +287,14 @@ def sync_to_github_api(file_path):
                 sha = res_data.get("sha")
         except urllib.error.HTTPError as e:
             if e.code != 404:
-                return False, f"HTTP Error {e.code} (SHA取得失敗)"
+                return False, f"SHA取得失敗 (HTTP {e.code})"
                 
+        # 2. Read file content and base64 encode
         with open(file_path, "rb") as f:
             content_b64 = base64.b64encode(f.read()).decode("utf-8")
             
-        now_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
         payload = {
-            "message": f"Auto-update wastewater data via App [{now_str}]",
+            "message": f"Auto-update wastewater data via App [{pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}]",
             "content": content_b64,
             "branch": branch
         }
@@ -304,13 +306,12 @@ def sync_to_github_api(file_path):
         
         with urllib.request.urlopen(req_put) as resp:
             if resp.status in [200, 201]:
-                return True, "成功"
+                return True, "Success"
             return False, f"HTTP Status {resp.status}"
     except Exception as ex:
         return False, str(ex)
 
 
-@st.cache_data(ttl=1)
 def load_all_data(path):
     if not os.path.exists(path):
         st.error(f"データベースファイルが見つかりません: {path}")
@@ -323,20 +324,19 @@ def load_all_data(path):
     df_rep = pd.read_excel(xls, "Daily Report")
     df_rec = pd.read_excel(xls, "Inspection Records")
     
+    # 旧DBファイル(北越コーポレーション/S003)が読まれても自動排除
     df_site = df_site[~df_site["Site_Name"].astype(str).str.contains("北越") & (df_site["Site_ID"] != "S003")]
     df_loc = df_loc[~df_loc["Site_ID"].isin(["S003"]) & df_loc["Site_ID"].isin(df_site["Site_ID"])]
     df_item = df_item[df_item["Loc_ID"].isin(df_loc["Loc_ID"])]
     df_rep = df_rep[df_rep["Site_ID"].isin(df_site["Site_ID"])]
     df_rec = df_rec[df_rec["Report_ID"].isin(df_rep["Report_ID"])]
 
+    # 型変換・整形
     df_rep["Date"] = pd.to_datetime(df_rep["Date"]).dt.strftime("%Y/%m/%d")
     
     val_str_series = df_rec["Value"].astype(str)
-    has_comma_decimal = val_str_series.str.contains(r'^\d+,\d+$', regex=True)
-    val_clean = val_str_series.copy()
-    val_clean[has_comma_decimal] = val_clean[has_comma_decimal].str.replace(',', '.', regex=False)
     val_clean = (
-        val_clean
+        val_str_series
         .str.replace(",", "", regex=False)
         .str.replace("%", "", regex=False)
         .str.replace("<", "", regex=False)
@@ -352,10 +352,6 @@ df_site, df_loc, df_item, df_rep, df_rec = load_all_data(db_path)
 if df_site is None:
     st.stop()
 
-# 日本時間 (JST) 当日日付取得
-def get_jst_today():
-    return (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=9)).date()
-
 # タイトル表示
 st.markdown("<div class='main-header'>🌱 排水処理点検・水質データ管理システム (KBL Management App)</div>", unsafe_allow_html=True)
 
@@ -363,6 +359,7 @@ st.markdown("<div class='main-header'>🌱 排水処理点検・水質データ�
 st.sidebar.image("https://img.icons8.com/color/96/000000/sprout.png", width=64)
 st.sidebar.title("📌 対象設定")
 
+# ① 現場の選択
 site_options = dict(zip(df_site["Site_ID"], df_site["Site_Name"]))
 selected_site_id = st.sidebar.selectbox(
     "① 現場を選択",
@@ -370,6 +367,7 @@ selected_site_id = st.sidebar.selectbox(
     format_func=lambda x: site_options[x]
 )
 
+# ② シートの選択（点検管理表 or 計量証明）
 available_sheet_types = ["点検管理表", "計量証明"]
 
 selected_sheet_type = st.sidebar.radio(
@@ -382,32 +380,33 @@ st.sidebar.markdown("---")
 st.sidebar.info(f"**選択中の現場**: {site_options[selected_site_id]}\n\n**シート**: {selected_sheet_type}")
 
 # ==========================================
-# 3. メイン画面タブ構成
+# 3. メイン画面タブ構成 (要件①〜⑥)
 # ==========================================
 tab1, tab2, tab3, tab4 = st.tabs([
-    "📝 ①〜④ 点検データ入力",
-    "📊 ⑤ 動的2軸・複数槽比較水質グラフ",
+    "📝 ①〜④ 点検データ入力", 
+    "📊 ⑤ 動的2軸・複数槽比較水質グラフ", 
     "📑 ⑥ エクセル帳票ダウンロード",
     "🗃️ データベース全件閲覧"
 ])
 
 # ------------------------------------------
-# TAB 1: 点検データ入力
+# TAB 1: 点検データ入力 (要件①〜④) + 異常値チェック
 # ------------------------------------------
 with tab1:
     if "save_success_msg" in st.session_state:
         st.success(st.session_state["save_success_msg"])
         del st.session_state["save_success_msg"]
-        
     st.markdown("<div class='sub-header'>📝 点検結果の新規入力 ＆ 蓄積 (過去データとの異常値チェック機能付き)</div>", unsafe_allow_html=True)
-
+    
     col_input1, col_input2 = st.columns(2)
-
+    
     with col_input1:
-        input_date = st.date_input("③ 点検日を選択", value=get_jst_today(), key="input_date_key")
+        # ③ 日付の選択 (原則当日、変更可)
+        input_date = st.date_input("③ 点検日を選択", datetime.date.today())
         input_date_str = input_date.strftime("%Y/%m/%d")
-
+        
     with col_input2:
+        # 該当現場・シート種別に適した Location フィルタ
         locs_with_items = df_item[(df_item["Loc_ID"].isin(df_loc[df_loc["Site_ID"] == selected_site_id]["Loc_ID"])) & (df_item["Sheet_Type"] == selected_sheet_type)]["Loc_ID"].unique()
         site_locs = df_loc[(df_loc["Site_ID"] == selected_site_id) & (df_loc["Loc_ID"].isin(locs_with_items))].sort_values("Display_Order")
         if site_locs.empty:
@@ -420,12 +419,14 @@ with tab1:
     st.markdown("---")
     if selected_loc_id:
         st.markdown(f"#### 📍 【{site_options[selected_site_id]}】 - 『{loc_options[selected_loc_id]}』 ({selected_sheet_type})")
-
+        
+        # 選択された Loc & Sheet_Type に対応する Item を抽出
         loc_items = df_item[(df_item["Loc_ID"] == selected_loc_id) & (df_item["Sheet_Type"] == selected_sheet_type)].sort_values("Display_Order")
-
+        
         if loc_items.empty:
             st.warning("指定された槽・シート種別の点検項目が登録されていません。")
         else:
+            # 既存データのプレロード判定
             existing_rep = df_rep[(df_rep["Site_ID"] == selected_site_id) & (df_rep["Date"] == input_date_str) & (df_rep["Sheet_Type"] == selected_sheet_type)]
             existing_values = {}
             if not existing_rep.empty:
@@ -433,14 +434,12 @@ with tab1:
                 rec_exist = df_rec[df_rec["Report_ID"] == rep_id_exist]
                 existing_values = dict(zip(rec_exist["Item_ID"], rec_exist["Value"]))
                 st.info(f"💡 {input_date_str} の既存データが読み込まれました。必要に応じて内容を更新してください。")
-
+                
+            # 過去データの統計情報算出 (異常値チェック用)
+            df_hist = df_rec[df_rec["Item_ID"].isin(loc_items["Item_ID"])].dropna(subset=["Value_Num"])
             stats_by_item = {}
-            rep_site_match = df_rep[(df_rep["Site_ID"] == selected_site_id) & (df_rep["Sheet_Type"] == selected_sheet_type)]
-            rec_site_match = df_rec[df_rec["Report_ID"].isin(rep_site_match["Report_ID"])]
-            
-            for item_id_key in loc_items["Item_ID"].unique():
-                item_recs = rec_site_match[rec_site_match["Item_ID"] == item_id_key]["Value_Num"].dropna()
-                vals = item_recs.values
+            for item_id_key, group in df_hist.groupby("Item_ID"):
+                vals = group["Value_Num"].values
                 if len(vals) >= 2:
                     mean_v = np.mean(vals)
                     std_v = np.std(vals)
@@ -460,40 +459,58 @@ with tab1:
 
             st.info("💡 **自動計算項目（有機割合・無機割合・水面積負荷・沈降速度・返送率など）** は、入力された基礎数値から保存時に**全自動計算されExcelデータベースへ直接格納**されます（入力ボックスは非表示としています）。")
             
-            calc_item_names = ['有機割合', '有機割合 (%)', '無機割合', '沈降速度', '水面積負荷', '沈降速度/水面積負荷', '返送率', '返送率 (%)', 'SVI', 'BOD除去率']
+            # 自動計算項目を入力フォームから除外
+            calc_item_names = ['有機割合', '有機割合 (%)', '無機割合', '沈降速度', '水面積負荷', '沈降速度/水面積負荷', '返送率', '返送率 (%)']
             input_items = loc_items[~loc_items['Item_Name'].isin(calc_item_names)].sort_values("Display_Order")
+
+            # スマホ用テンキー（inputmode="decimal"）自動適用 JavaScript (st.form の外に配置)
+            components.html("""
+            <script>
+            function setInputMode() {
+                const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+                inputs.forEach(input => {
+                    input.setAttribute('inputmode', 'decimal');
+                });
+            }
+            setTimeout(setInputMode, 300);
+            setTimeout(setInputMode, 1000);
+            </script>
+            """, height=0, width=0)
 
             with st.form("inspection_input_form"):
                 form_data = {}
-                cols = st.columns(3)
-                
-                for idx, (_, item) in enumerate(input_items.iterrows()):
-                    item_id = item["Item_ID"]
-                    item_name = item["Item_Name"]
-                    vtype = item["Value_Type"]
-                    unit = str(item["Unit_or_Options"]) if pd.notna(item["Unit_or_Options"]) else ""
-                    
-                    default_val = existing_values.get(item_id, "")
-                    
-                    label_str = item_name if vtype == "Enum" or not unit or unit == "nan" else f"{item_name} ({unit})"
-                    col_target = cols[idx % 3]
-                    
-                    with col_target:
-                        if vtype == "Enum":
-                            opts = ["-", "無", "微少", "少", "中", "多"]
-                            curr_idx = opts.index(default_val) if default_val in opts else 0
-                            form_data[item_id] = st.selectbox(label_str, options=opts, index=curr_idx)
-                        else:
-                            form_data[item_id] = st.text_input(label_str, value=str(default_val) if str(default_val) != "nan" else "")
-                            if item_id in stats_by_item:
-                                st_info = stats_by_item[item_id]
-                                st.caption(f"💡 過去平均: {st_info['mean']:.2f} (目安: {st_info['lower']:.1f} 〜 {st_info['upper']:.1f})")
+                input_items_list = list(input_items.iterrows())
+
+                for row_start in range(0, len(input_items_list), 3):
+                    row_chunk = input_items_list[row_start : row_start + 3]
+                    cols = st.columns(3)
+                    for c_idx, (_, item) in enumerate(row_chunk):
+                        item_id = item["Item_ID"]
+                        item_name = item["Item_Name"]
+                        vtype = item["Value_Type"]
+                        unit = str(item["Unit_or_Options"]) if pd.notna(item["Unit_or_Options"]) else ""
+
+                        default_val = existing_values.get(item_id, "")
+                        label_str = item_name if vtype == "Enum" or not unit or unit == "nan" else f"{item_name} ({unit})"
+                        col_target = cols[c_idx]
+
+                        with col_target:
+                            if vtype == "Enum":
+                                opts = ["-", "無", "微少", "少", "中", "多"]
+                                curr_idx = opts.index(default_val) if default_val in opts else 0
+                                form_data[item_id] = st.selectbox(label_str, options=opts, index=curr_idx)
+                            else:
+                                form_data[item_id] = st.text_input(label_str, value=str(default_val) if str(default_val) != "nan" else "")
+                                if item_id in stats_by_item:
+                                    st_info = stats_by_item[item_id]
+                                    st.caption(f"💡 過去平均: {st_info['mean']:.2f} (目安: {st_info['lower']:.1f} 〜 {st_info['upper']:.1f})")
 
                 notes_input = st.text_area("備考 (Notes)", value=existing_rep.iloc[0]["Notes"] if not existing_rep.empty and pd.notna(existing_rep.iloc[0]["Notes"]) else "")
                 
                 submit_btn = st.form_submit_button("💾 点検データを保存・蓄積する")
                 
                 if submit_btn:
+                    # 異常値チェック
                     anomalies = []
                     for item_id, val in form_data.items():
                         val_str = str(val).strip().replace(",", "").replace("%", "").replace("<", "").replace(">", "")
@@ -511,6 +528,7 @@ with tab1:
                     if anomalies:
                         st.warning("⚠️ **【異常値・誤入力の可能性あり】**\n" + "\n".join(anomalies) + "\n\n※数値に問題が無ければ、データは正常に保存されます。")
 
+                    # Excelへの書き込み処理
                     wb = openpyxl.load_workbook(db_path)
                     ws_rep = wb["Daily Report"]
                     ws_rec = wb["Inspection Records"]
@@ -544,6 +562,7 @@ with tab1:
                         if m:
                             max_rec_num = max(max_rec_num, int(m.group()))
                             
+                    # 自動計算処理の実行 (有機割合, 無機割合, 水面積負荷, 沈降速度, 沈降速度/水面積負荷, 返送率)
                     auto_calcs = calculate_auto_metrics(df_item, df_loc, selected_site_id, selected_sheet_type, form_data, df_rec_latest, target_rep_id)
                     final_save_data = form_data.copy()
                     final_save_data.update(auto_calcs)
@@ -568,17 +587,23 @@ with tab1:
                     if sync_ok:
                         st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました（GitHubへの自動同期も成功しました）！"
                     else:
-                        st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました（ローカル更新完了 / GitHub同期: {sync_msg}）"
+                        st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました（※GitHub同期: {sync_msg}）"
                     st.rerun()
 
 # ------------------------------------------
-# TAB 2: 動的2軸・複数槽比較水質グラフ
+# TAB 2: 動的2軸・複数槽比較水質グラフ (要件⑤)
 # ------------------------------------------
 with tab2:
     st.markdown("<div class='sub-header'>📊 期間・複数槽(最大3箇所)・1軸/2軸の比較水質グラフ</div>", unsafe_allow_html=True)
     
-    g_locs_with_items = df_item[(df_item["Loc_ID"].isin(df_loc[df_loc["Site_ID"] == selected_site_id]["Loc_ID"])) & (df_item["Sheet_Type"] == selected_sheet_type)]["Loc_ID"].unique()
-    g_site_locs = df_loc[(df_loc["Site_ID"] == selected_site_id) & (df_loc["Loc_ID"].isin(g_locs_with_items))].sort_values("Display_Order")
+    # 該当現場・シート種別で使用可能な全 Location を取得
+    g_locs_with_items = df_item[(
+        df_item["Loc_ID"].isin(df_loc[df_loc["Site_ID"] == selected_site_id]["Loc_ID"])
+    ) & (df_item["Sheet_Type"] == selected_sheet_type)]["Loc_ID"].unique()
+    
+    g_site_locs = df_loc[(
+        df_loc["Site_ID"] == selected_site_id
+    ) & (df_loc["Loc_ID"].isin(g_locs_with_items))].sort_values("Display_Order")
     
     if g_site_locs.empty:
         st.warning("⚠️ 該当する槽・測定箇所データが存在しません。")
@@ -589,6 +614,7 @@ with tab2:
         col_g1, col_g2, col_g3 = st.columns([2.5, 2, 2])
         
         with col_g1:
+            # 槽の選択 (最大3つまで複数選択可能)
             selected_loc_ids = st.multiselect(
                 "📍 比較する槽（測定箇所）を選択 (最大3つ)",
                 options=all_loc_ids,
@@ -601,144 +627,270 @@ with tab2:
         if not selected_loc_ids:
             st.info("比較する槽を1つ以上選択してください。")
         else:
-            sel_items = df_item[(df_item["Loc_ID"].isin(selected_loc_ids)) & (df_item["Sheet_Type"] == selected_sheet_type)].sort_values("Display_Order")
+            # 選択された全槽に属する項目を抽出
+            sel_items = df_item[(
+                df_item["Loc_ID"].isin(selected_loc_ids)
+            ) & (df_item["Sheet_Type"] == selected_sheet_type)].sort_values("Display_Order")
             
-            unique_item_names = sel_items["Item_Name"].drop_duplicates().tolist()
+            # ユニークな項目名リストを作成 (単位付きラベル)
+            unique_item_names = []
+            item_name_to_unit = {}
+            for _, r in sel_items.iterrows():
+                iname = r["Item_Name"]
+                uopt = str(r["Unit_or_Options"]) if pd.notna(r["Unit_or_Options"]) else ""
+                if iname not in unique_item_names:
+                    unique_item_names.append(iname)
+                if iname in ["無機割合", "有機割合", "返送率"]:
+                    item_name_to_unit[iname] = " (%)"
+                elif uopt and uopt != "nan":
+                    item_name_to_unit[iname] = f" ({uopt})"
+                elif iname not in item_name_to_unit:
+                    item_name_to_unit[iname] = ""
+                    
+            item_display_map = {iname: f"{iname}{item_name_to_unit.get(iname, '')}" for iname in unique_item_names}
             
             with col_g2:
-                selected_primary_item = st.selectbox(
-                    "📈 第1縦軸 (左軸/実線)",
-                    options=unique_item_names if unique_item_names else ["データなし"],
-                    key="g_primary_item"
+                selected_item_y1 = st.selectbox(
+                    "📈 第1縦軸 (左軸/実線・●)",
+                    options=unique_item_names,
+                    format_func=lambda x: item_display_map[x],
+                    key="g_y1_name"
                 )
                 
             with col_g3:
-                secondary_options = ["(なし)"] + unique_item_names
-                selected_secondary_item = st.selectbox(
-                    "📉 第2縦軸 (右軸/破線 - オプション)",
-                    options=secondary_options,
-                    index=0,
-                    key="g_secondary_item"
+                y2_options = [None] + unique_item_names
+                selected_item_y2 = st.selectbox(
+                    "📉 第2縦軸 (右軸/実線・◆ - オプション)",
+                    options=y2_options,
+                    format_func=lambda x: "なし (1軸のみ)" if x is None else item_display_map[x],
+                    key="g_y2_name"
                 )
 
             st.markdown("---")
-            
-            rep_site = df_rep[(df_rep["Site_ID"] == selected_site_id) & (df_rep["Sheet_Type"] == selected_sheet_type)]
-            
-            if not rep_site.empty:
-                dates = pd.to_datetime(rep_site["Date"]).sort_values()
-                min_d = dates.min().date()
-                max_d = dates.max().date()
-                
-                st.markdown("##### 📅 期間絞り込み")
-                col_d1, col_d2 = st.columns(2)
-                with col_d1:
-                    start_d = st.date_input("開始日", value=min_d, min_value=min_d, max_value=max_d)
-                with col_d2:
-                    end_d = st.date_input("終了日", value=max_d, min_value=min_d, max_value=max_d)
-            else:
-                start_d, end_d = None, None
+            st.markdown("##### 📅 グラフ表示期間の設定")
 
-            if selected_loc_ids and selected_primary_item and selected_primary_item != "データなし":
-                filtered_rep = rep_site[
-                    (pd.to_datetime(rep_site["Date"]).dt.date >= start_d) & 
-                    (pd.to_datetime(rep_site["Date"]).dt.date <= end_d)
-                ]
+            site_reps = df_rep[(df_rep["Site_ID"] == selected_site_id) & (df_rep["Sheet_Type"] == selected_sheet_type)]
+            if not site_reps.empty:
+                site_dates_dt = pd.to_datetime(site_reps["Date"]).sort_values().drop_duplicates()
+                all_date_strs = site_dates_dt.dt.strftime("%Y/%m/%d").tolist()
+                min_d = site_dates_dt.min().date()
+                max_d = site_dates_dt.max().date()
+            else:
+                all_date_strs = [datetime.date.today().strftime("%Y/%m/%d")]
+                min_d = datetime.date(2023, 1, 1)
+                max_d = datetime.date.today()
+
+            # 状態更新用コールバック関数 (最も近い実点検日へ自動アラインメント)
+            def update_range_state(target_s_d, target_e_d):
+                target_s_dt = pd.to_datetime(target_s_d)
+                target_e_dt = pd.to_datetime(target_e_d)
                 
-                fig = make_subplots(specs=[[{"secondary_y": True}]])
-                colors = ["#2E7D32", "#1976D2", "#E65100", "#D32F2F", "#7B1FA2"]
-                summary_data = []
+                closest_s_str = min(all_date_strs, key=lambda x: abs((pd.to_datetime(x) - target_s_dt).days))
+                closest_e_str = min(all_date_strs, key=lambda x: abs((pd.to_datetime(x) - target_e_dt).days))
                 
-                for i, loc_id in enumerate(selected_loc_ids):
-                    loc_name = graph_loc_options[loc_id]
-                    color = colors[i % len(colors)]
+                st.session_state["g_start_d"] = pd.to_datetime(closest_s_str).date()
+                st.session_state["g_end_d"] = pd.to_datetime(closest_e_str).date()
+                st.session_state["sel_start_str"] = closest_s_str
+                st.session_state["sel_end_str"] = closest_e_str
+
+            # 初期セッション状態の設定
+            if "g_start_d" not in st.session_state or st.session_state.get("g_last_site") != selected_site_id or st.session_state.get("g_last_sheet") != selected_sheet_type:
+                update_range_state(min_d, max_d)
+                st.session_state["g_last_site"] = selected_site_id
+                st.session_state["g_last_sheet"] = selected_sheet_type
+
+            # 1. プリセットボタン ＆ リセットボタン群
+            btn_c1, btn_c2, btn_c3, btn_c4, btn_c5 = st.columns([1.5, 1, 1, 1, 1])
+            with btn_c1:
+                if st.button("🔄 期間リセット (全期間)", key="btn_reset"):
+                    update_range_state(min_d, max_d)
+                    st.rerun()
                     
-                    item_p = df_item[(df_item["Loc_ID"] == loc_id) & (df_item["Sheet_Type"] == selected_sheet_type) & (df_item["Item_Name"] == selected_primary_item)]
-                    if not item_p.empty:
-                        item_p_id = item_p.iloc[0]["Item_ID"]
-                        rec_p = df_rec[(df_rec["Report_ID"].isin(filtered_rep["Report_ID"])) & (df_rec["Item_ID"] == item_p_id)]
-                        merged_p = filtered_rep.merge(rec_p, on="Report_ID").sort_values("Date")
+            with btn_c2:
+                if st.button("過去3ヶ月", key="btn_3m"):
+                    s_3m = max(min_d, (pd.to_datetime(max_d) - pd.DateOffset(months=3)).date())
+                    update_range_state(s_3m, max_d)
+                    st.rerun()
+                    
+            with btn_c3:
+                if st.button("過去6ヶ月", key="btn_6m"):
+                    s_6m = max(min_d, (pd.to_datetime(max_d) - pd.DateOffset(months=6)).date())
+                    update_range_state(s_6m, max_d)
+                    st.rerun()
+                    
+            with btn_c4:
+                if st.button("過去1年", key="btn_1y"):
+                    s_1y = max(min_d, (pd.to_datetime(max_d) - pd.DateOffset(years=1)).date())
+                    update_range_state(s_1y, max_d)
+                    st.rerun()
+                    
+            with btn_c5:
+                if st.button("過去2年", key="btn_2y"):
+                    s_2y = max(min_d, (pd.to_datetime(max_d) - pd.DateOffset(years=2)).date())
+                    update_range_state(s_2y, max_d)
+                    st.rerun()
+
+            # 2. 開始点検日・終了点検日のドロップダウン選択
+            d_col1, d_col2 = st.columns(2)
+            
+            curr_start_str = st.session_state["g_start_d"].strftime("%Y/%m/%d") if isinstance(st.session_state["g_start_d"], (datetime.date, pd.Timestamp)) else all_date_strs
+            curr_start_idx = all_date_strs.index(curr_start_str) if curr_start_str in all_date_strs else 0
+            
+            with d_col1:
+                sel_start_str = st.selectbox("📅 開始点検日を選択", options=all_date_strs, index=curr_start_idx, key="sel_start_str")
+                st.session_state["g_start_d"] = pd.to_datetime(sel_start_str).date()
+
+            curr_end_str = st.session_state["g_end_d"].strftime("%Y/%m/%d") if isinstance(st.session_state["g_end_d"], (datetime.date, pd.Timestamp)) else all_date_strs[-1]
+            curr_end_idx = all_date_strs.index(curr_end_str) if curr_end_str in all_date_strs else len(all_date_strs) - 1
+            
+            with d_col2:
+                sel_end_str = st.selectbox("📅 終了点検日を選択", options=all_date_strs, index=curr_end_idx, key="sel_end_str")
+                st.session_state["g_end_d"] = pd.to_datetime(sel_end_str).date()
+
+            start_d = st.session_state["g_start_d"]
+            end_d = st.session_state["g_end_d"]
+
+            # 選択期間内の点検回数表示
+            active_dates_in_range = [d for d in site_dates_dt.dt.date if start_d <= d <= end_d]
+            st.info(f"💡 **選択中の期間 ({start_d.strftime('%Y/%m/%d')} 〜 {end_d.strftime('%Y/%m/%d')}) に含まれる点検日**: **{len(active_dates_in_range)} 回**")
+
+            st.markdown("---")
+            
+            # 対象期間の Daily Report を抽出
+            site_reps_filtered = df_rep[(
+                df_rep["Site_ID"] == selected_site_id
+            ) & (
+                df_rep["Sheet_Type"] == selected_sheet_type
+            )].copy()
+            site_reps_filtered["Date_dt"] = pd.to_datetime(site_reps_filtered["Date"])
+            
+            if start_d and end_d:
+                site_reps_filtered = site_reps_filtered[
+                    (site_reps_filtered["Date_dt"].dt.date >= start_d) &
+                    (site_reps_filtered["Date_dt"].dt.date <= end_d)
+                ]
+            site_reps_filtered = site_reps_filtered.sort_values("Date_dt")
+            
+            # 各槽のカラーパレット定義 (Y1とY2で明確に異なる対比色・すべて実線)
+            # 槽1: 左軸=深緑 (#2E7D32) / 右軸=鮮やかブルー (#1976D2)
+            # 槽2: 左軸=黄緑 (#7CB342) / 右軸=パープル (#8E24AA)
+            # 槽3: 左軸=オレンジ (#F57C00) / 右軸=ターコイズシアン (#00ACC1)
+            loc_colors = [
+                {"y1": "#2E7D32", "y2": "#1976D2", "label": "槽1(緑/青)"},
+                {"y1": "#7CB342", "y2": "#8E24AA", "label": "槽2(黄緑/紫)"},
+                {"y1": "#F57C00", "y2": "#00ACC1", "label": "槽3(橙/水色)"}
+            ]
+            
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            has_data = False
+            summary_data = []
+            
+            for l_idx, loc_id in enumerate(selected_loc_ids):
+                loc_name = graph_loc_options[loc_id]
+                color_cfg = loc_colors[l_idx % len(loc_colors)]
+                
+                # 第1縦軸 (Y1)
+                item_y1_row = df_item[(
+                    df_item["Loc_ID"] == loc_id
+                ) & (
+                    df_item["Sheet_Type"] == selected_sheet_type
+                ) & (
+                    df_item["Item_Name"] == selected_item_y1
+                )]
+                
+                if not item_y1_row.empty:
+                    item_y1_id = item_y1_row.iloc[0]["Item_ID"]
+                    rec_y1 = df_rec[df_rec["Item_ID"] == item_y1_id][["Report_ID", "Value_Num"]]
+                    df_plot_y1 = site_reps_filtered.merge(rec_y1, on="Report_ID", how="left")
+                    
+                    valid_y1 = df_plot_y1.dropna(subset=["Value_Num"])
+                    if not valid_y1.empty:
+                        has_data = True
+                        fig.add_trace(
+                            go.Scatter(
+                                x=df_plot_y1["Date"],
+                                y=df_plot_y1["Value_Num"],
+                                name=f"【{loc_name}】{item_display_map[selected_item_y1]}",
+                                mode="lines+markers",
+                                connectgaps=False,
+                                line=dict(color=color_cfg["y1"], width=3),
+                                marker=dict(size=8, symbol="circle")
+                            ),
+                            secondary_y=False
+                        )
+                        summary_data.append({
+                            "槽名": loc_name,
+                            "軸": "左軸",
+                            "項目": item_display_map[selected_item_y1],
+                            "平均値": f"{valid_y1['Value_Num'].mean():.2f}",
+                            "最新値": f"{valid_y1.iloc[-1]['Value_Num']:.2f}",
+                            "最小値": f"{valid_y1['Value_Num'].min():.2f}",
+                            "最大値": f"{valid_y1['Value_Num'].max():.2f}"
+                        })
+                
+                # 第2縦軸 (Y2 - オプション)
+                if selected_item_y2:
+                    item_y2_row = df_item[(
+                        df_item["Loc_ID"] == loc_id
+                    ) & (
+                        df_item["Sheet_Type"] == selected_sheet_type
+                    ) & (
+                        df_item["Item_Name"] == selected_item_y2
+                    )]
+                    
+                    if not item_y2_row.empty:
+                        item_y2_id = item_y2_row.iloc[0]["Item_ID"]
+                        rec_y2 = df_rec[df_rec["Item_ID"] == item_y2_id][["Report_ID", "Value_Num"]]
+                        df_plot_y2 = site_reps_filtered.merge(rec_y2, on="Report_ID", how="left")
                         
-                        valid_p = merged_p.dropna(subset=["Value_Num"])
-                        if not valid_p.empty:
+                        valid_y2 = df_plot_y2.dropna(subset=["Value_Num"])
+                        if not valid_y2.empty:
+                            has_data = True
                             fig.add_trace(
                                 go.Scatter(
-                                    x=merged_p["Date"],
-                                    y=merged_p["Value_Num"],
+                                    x=df_plot_y2["Date"],
+                                    y=df_plot_y2["Value_Num"],
+                                    name=f"【{loc_name}】{item_display_map[selected_item_y2]} (右軸)",
                                     mode="lines+markers",
-                                    name=f"{loc_name} - {selected_primary_item}",
-                                    line=dict(color=color, width=2.5),
-                                    marker=dict(size=6)
+                                    connectgaps=False,
+                                    line=dict(color=color_cfg["y2"], width=3),
+                                    marker=dict(size=8, symbol="diamond")
                                 ),
-                                secondary_y=False
+                                secondary_y=True
                             )
-                            v_last = valid_p.iloc[-1]["Value_Num"]
-                            v_mean = valid_p["Value_Num"].mean()
-                            v_min = valid_p["Value_Num"].min()
-                            v_max = valid_p["Value_Num"].max()
                             summary_data.append({
                                 "槽名": loc_name,
-                                "軸": "左軸 (第1軸)",
-                                "項目名": selected_primary_item,
-                                "最新値": f"{v_last:.2f}".rstrip('0').rstrip('.'),
-                                "平均値": f"{v_mean:.2f}".rstrip('0').rstrip('.'),
-                                "最小値": f"{v_min:.2f}".rstrip('0').rstrip('.'),
-                                "最大値": f"{v_max:.2f}".rstrip('0').rstrip('.')
+                                "軸": "右軸",
+                                "項目": item_display_map[selected_item_y2],
+                                "平均値": f"{valid_y2['Value_Num'].mean():.2f}",
+                                "最新値": f"{valid_y2.iloc[-1]['Value_Num']:.2f}",
+                                "最小値": f"{valid_y2['Value_Num'].min():.2f}",
+                                "最大値": f"{valid_y2['Value_Num'].max():.2f}"
                             })
-                    
-                    if selected_secondary_item and selected_secondary_item != "(なし)":
-                        item_s = df_item[(df_item["Loc_ID"] == loc_id) & (df_item["Sheet_Type"] == selected_sheet_type) & (df_item["Item_Name"] == selected_secondary_item)]
-                        if not item_s.empty:
-                            item_s_id = item_s.iloc[0]["Item_ID"]
-                            rec_s = df_rec[(df_rec["Report_ID"].isin(filtered_rep["Report_ID"])) & (df_rec["Item_ID"] == item_s_id)]
-                            merged_s = filtered_rep.merge(rec_s, on="Report_ID").sort_values("Date")
                             
-                            valid_s = merged_s.dropna(subset=["Value_Num"])
-                            if not valid_s.empty:
-                                fig.add_trace(
-                                    go.Scatter(
-                                        x=merged_s["Date"],
-                                        y=merged_s["Value_Num"],
-                                        mode="lines+markers",
-                                        name=f"{loc_name} - {selected_secondary_item}",
-                                        line=dict(color=color, width=2, dash="dash"),
-                                        marker=dict(size=5, symbol="diamond")
-                                    ),
-                                    secondary_y=True
-                                )
-                                v_last_s = valid_s.iloc[-1]["Value_Num"]
-                                v_mean_s = valid_s["Value_Num"].mean()
-                                v_min_s = valid_s["Value_Num"].min()
-                                v_max_s = valid_s["Value_Num"].max()
-                                summary_data.append({
-                                    "槽名": loc_name,
-                                    "軸": "右軸 (第2軸)",
-                                    "項目名": selected_secondary_item,
-                                    "最新値": f"{v_last_s:.2f}".rstrip('0').rstrip('.'),
-                                    "平均値": f"{v_mean_s:.2f}".rstrip('0').rstrip('.'),
-                                    "最小値": f"{v_min_s:.2f}".rstrip('0').rstrip('.'),
-                                    "最大値": f"{v_max_s:.2f}".rstrip('0').rstrip('.')
-                                })
-
-                title_str = f"【{site_options[selected_site_id]}】 水質推移グラフ ({selected_sheet_type})"
+            if not has_data:
+                st.warning("選択した期間・槽・項目には数値データが存在しません。")
+            else:
+                title_locs_str = " vs ".join([graph_loc_options[lid] for lid in selected_loc_ids])
+                title_text = f"【{site_options[selected_site_id]}】 ({title_locs_str}) 水質変化比較グラフ"
+                
                 fig.update_layout(
-                    title=dict(text=title_str, font=dict(size=18, color="#2E7D32")),
+                    title_text=title_text,
+                    xaxis_title="点検日 (Date)",
+                    template="plotly_white",
                     hovermode="x unified",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                    margin=dict(l=40, r=40, t=60, b=40),
-                    paper_bgcolor="#FFFFFF",
-                    plot_bgcolor="#F9FBF7"
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                 )
-                fig.update_xaxes(title_text="測定日", showgrid=True, gridcolor="#E8F5E9")
-                fig.update_yaxes(title_text=selected_primary_item, secondary_y=False, showgrid=True, gridcolor="#E8F5E9")
-                if selected_secondary_item and selected_secondary_item != "(なし)":
-                    fig.update_yaxes(title_text=selected_secondary_item, secondary_y=True, showgrid=False)
-
+                
+                fig.update_yaxes(title_text=f"<b>{item_display_map[selected_item_y1]}</b>", secondary_y=False, title_font=dict(color="#2E7D32"))
+                if selected_item_y2:
+                    fig.update_yaxes(title_text=f"<b>{item_display_map[selected_item_y2]}</b>", secondary_y=True, title_font=dict(color="#1565C0"))
+                    
                 st.plotly_chart(fig, use_container_width=True)
                 st.caption("📸 グラフ右上のカメラアイコンをタップすると、グラフをPNG画像としてワンクリック保存できます。")
                 
                 if summary_data:
-                    st.markdown("##### 📈 選択項目の水質統計サマリー (最新値・平均値・最小値・最大値)")
+                    st.markdown("##### 📈 槽別・項目別 統計サマリー一覧")
                     df_sum = pd.DataFrame(summary_data)
                     st.dataframe(df_sum, use_container_width=True)
 
@@ -782,118 +934,15 @@ with tab3:
             
         df_raw = pd.DataFrame(data_rows)
         
-        # 出力対象年の選択ドロップダウン (デフォルト: 全データ)
-        available_years = sorted(reports["Date_dt"].dt.year.dropna().unique().astype(int).tolist(), reverse=True)
-        year_options = ["全データ"] + [f"{y}年" for y in available_years]
-        
-        selected_year_opt = st.selectbox("📅 出力対象年を選択", options=year_options, index=0)
-        
-        if selected_year_opt == "全データ":
-            df_export = df_raw.copy()
-            file_year_str = "全データ"
-        else:
-            sel_y = int(selected_year_opt.replace("年", ""))
-            df_export = df_raw[pd.to_datetime(df_raw["Date"], errors="coerce").dt.year == sel_y].copy()
-            file_year_str = f"{sel_y}年"
-        
         mi_cols = [("基本情報", "日付")] + [(loc_name, item_name) for _, loc_name, item_name in col_defs] + [("基本情報", "備考")]
         raw_col_keys = ["Date"] + [item_id for item_id, _, _ in col_defs] + ["Notes"]
         
-        df_preview = df_export[raw_col_keys].copy()
+        df_preview = df_raw[raw_col_keys].copy()
         df_preview.columns = pd.MultiIndex.from_tuples(mi_cols)
         
-        st.markdown(f"##### プレビュー ({selected_year_opt} - 2段ヘッダー構造)")
-        st.dataframe(df_preview.tail(10) if len(df_preview) > 10 else df_preview, use_container_width=True)
+        st.markdown("##### プレビュー (最新10件 - 2段ヘッダー構造)")
+        st.dataframe(df_preview.tail(10), use_container_width=True)
         
-        # 🤖 AI水質診断 ＆ 傾向分析コメント (全項目自動チェック)
-        def get_ai_analysis_comment(site_id, sheet_type):
-            rep_sub = df_rep[(df_rep['Site_ID'] == site_id) & (df_rep['Sheet_Type'] == sheet_type)].copy()
-            if rep_sub.empty:
-                return ""
-            rep_sub['Date_dt'] = pd.to_datetime(rep_sub['Date'])
-            rep_sub = rep_sub.sort_values('Date_dt')
-            latest_rep = rep_sub.iloc[-1]
-            latest_date_str = latest_rep['Date']
-            latest_notes = str(latest_rep['Notes']) if pd.notna(latest_rep['Notes']) and str(latest_rep['Notes']).strip() != "" else ""
-
-            rec_sub = df_rec[df_rec['Report_ID'].isin(rep_sub['Report_ID'])].copy()
-            rec_latest = rec_sub[rec_sub['Report_ID'] == latest_rep['Report_ID']]
-            
-            site_items = df_item[(df_item['Sheet_Type'] == sheet_type) & (df_item['Loc_ID'].isin(df_loc[df_loc['Site_ID'] == site_id]['Loc_ID']))]
-            
-            anomalies = []
-            good_points = []
-
-            for _, item_row in site_items.iterrows():
-                it_id = item_row['Item_ID']
-                it_name = item_row['Item_Name']
-                loc_name = df_loc[df_loc['Loc_ID'] == item_row['Loc_ID']].iloc[0]['Loc_Name'] if not df_loc[df_loc['Loc_ID'] == item_row['Loc_ID']].empty else ""
-                
-                it_recs = rec_sub[rec_sub['Item_ID'] == it_id]['Value_Num'].dropna()
-                if len(it_recs) < 2:
-                    continue
-                
-                mean_v = it_recs.mean()
-                std_v = it_recs.std()
-                
-                match_val = rec_latest[rec_latest['Item_ID'] == it_id]
-                if match_val.empty or pd.isna(match_val.iloc[0]['Value_Num']):
-                    continue
-                
-                val_latest = match_val.iloc[0]['Value_Num']
-                val_raw_str = str(match_val.iloc[0]['Value'])
-
-                if '除去率' in it_name or '%' in it_name:
-                    if val_latest >= 95.0 or '以上' in val_raw_str:
-                        good_points.append(f"<b>【{loc_name} {it_name}】</b>: 最新値 <b>{val_raw_str}</b>（全期間平均: {mean_v:.1f}%）。非常に高い処理能力・除去率を維持しています。")
-                    elif val_latest < mean_v - 1.5 * std_v:
-                        anomalies.append(f"<b>【{loc_name} {it_name} 低下懸念】</b>: 最新値 <b>{val_raw_str}</b>（全期間平均: {mean_v:.1f}%）。処理効率の低下が見られるため、原水負荷または曝気状態をご確認ください。")
-                elif 'SVI' in it_name:
-                    if val_latest > 150.0:
-                        anomalies.append(f"<b>【{loc_name} SVI 膨化注意】</b>: 最新値 <b>{val_latest:.1f} mL/g</b>（全期間平均: {mean_v:.1f} mL/g）。膨化（バルキング）の兆候があります。汚泥沈降性とDO/返送量をご確認ください。")
-                    elif 50.0 <= val_latest <= 150.0:
-                        good_points.append(f"<b>【{loc_name} SVI】</b>: 最新値 <b>{val_latest:.1f} mL/g</b>（全期間平均: {mean_v:.1f} mL/g）。理想的な沈降性範囲（50〜150 mL/g）を維持しています。")
-                elif 'pH' in it_name:
-                    if val_latest < 6.0 or val_latest > 8.5:
-                        anomalies.append(f"<b>【{loc_name} pH 変動注意】</b>: 最新値 <b>{val_latest:.2f}</b>（全期間平均: {mean_v:.2f}）。一般的管理目標（6.0〜8.5）から外れています。")
-                elif 'DO' in it_name:
-                    if val_latest < 0.5 and '曝気' in loc_name:
-                        anomalies.append(f"<b>【{loc_name} DO 低下注意】</b>: 最新値 <b>{val_latest:.2f} mg/L</b>（全期間平均: {mean_v:.2f} mg/L）。酸素不足の可能性があります。")
-                elif 'SS' in it_name and '処理水' in loc_name:
-                    if val_latest == 0:
-                        good_points.append(f"<b>【{loc_name} {it_name}】</b>: 最新値 <b>0 mg/L</b>（全期間平均: {mean_v:.1f} mg/L）。SSの流出はなく非常に良好な透明度です。")
-                    elif val_latest > mean_v + 2.0 * std_v:
-                        anomalies.append(f"<b>【{loc_name} {it_name} 上昇注意】</b>: 最新値 <b>{val_latest:.1f} mg/L</b>（全期間平均: {mean_v:.1f} mg/L）。平均を大幅に上回っています。キャリーオーバーにご注意ください。")
-                else:
-                    if std_v > 0 and abs(val_latest - mean_v) > 2.5 * std_v:
-                        direction = "大幅上昇" if val_latest > mean_v else "大幅低下"
-                        anomalies.append(f"<b>【{loc_name} {it_name} {direction}】</b>: 最新値 <b>{val_raw_str}</b>（全期間平均: {mean_v:.1f}）。通常推移範囲から乖離しています。")
-
-            comments_list = anomalies + good_points
-            
-            notes_str = f" <span style='color:#555555; font-size:13px;'>[現場特記事項: 「{latest_notes}」]</span>" if latest_notes else ""
-            
-            html_out = f"""
-            <div style='background-color:#F1F8E9; border-left:5px solid #66BB6A; border-radius:8px; padding:14px; margin-top:12px; margin-bottom:15px;'>
-                <div style='font-size:15px; font-weight:bold; color:#2E7D32; margin-bottom:8px;'>
-                    🤖 AI水質診断 ＆ 傾向分析コメント（最新点検日: {latest_date_str}）{notes_str}
-                </div>
-                <ul style='margin:0; padding-left:20px; font-size:14px; color:#333333; line-height:1.7;'>
-            """
-            
-            if not comments_list:
-                html_out += "<li><b>【水質全般 安定維持】</b>: 全測定項目が過去の通常変動範囲内で推移しており、処理プロセスは極めて良好に維持されています。</li>"
-            else:
-                for c_item in comments_list[:3]:
-                    html_out += f"<li style='margin-bottom:6px;'>{c_item}</li>"
-            
-            html_out += "</ul></div>"
-            return html_out
-
-        ai_comment_html = get_ai_analysis_comment(selected_site_id, selected_sheet_type)
-        if ai_comment_html:
-            st.markdown(ai_comment_html, unsafe_allow_html=True)
-
         def generate_formatted_excel(selected_site_id, selected_sheet_type, site_name):
             output = io.BytesIO()
             wb = openpyxl.Workbook()
@@ -910,7 +959,7 @@ with tab3:
             ws.append(header1)
             ws.append(header2)
             
-            for _, r in df_export.iterrows():
+            for _, r in df_raw.iterrows():
                 row_arr = [r["Date"]] + [r[item_id] for item_id, _, _ in col_defs] + [r["Notes"]]
                 ws.append(row_arr)
                 
@@ -975,9 +1024,9 @@ with tab3:
         excel_bytes = generate_formatted_excel(selected_site_id, selected_sheet_type, site_options[selected_site_id])
         
         st.download_button(
-            label=f"📥 【{selected_year_opt}】 {site_options[selected_site_id]} エクセル帳票 (.xlsx) をダウンロード",
+            label="📥 原本と同仕様のExcelデータ (.xlsx) をダウンロードする",
             data=excel_bytes,
-            file_name=f"{site_options[selected_site_id]}_{selected_sheet_type}_{file_year_str}.xlsx",
+            file_name=f"{site_options[selected_site_id]}_{selected_sheet_type}_全データ.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
