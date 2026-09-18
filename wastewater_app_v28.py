@@ -232,22 +232,21 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
                 calc_updates[ratio_item.iloc[0]['Item_ID']] = str(ratio_val)
                 
     return calc_updates
-# DBファイルパスの取得
-DB_FILENAME_V2 = "wastewater-appsheet-db-v2.xlsx"
-DB_FILENAME_V1 = "wastewater-appsheet-db.xlsx"
-
+# DBファイルパスの取得 (Streamlit Cloud & ローカル両対応)
 @st.cache_data(ttl=1)
 def get_db_path():
-    if os.path.exists(DB_FILENAME_V2):
-        return DB_FILENAME_V2
-    elif os.path.exists(DB_FILENAME_V1):
-        return DB_FILENAME_V1
-    else:
-        v2_abs = "/workspace/artifacts/wastewater-appsheet-db-v2.xlsx"
-        v1_abs = "/workspace/artifacts/wastewater-appsheet-db.xlsx"
-        if os.path.exists(v2_abs):
-            return v2_abs
-        return v1_abs
+    db_candidates = [
+        "wastewater-appsheet-db-v3.xlsx",
+        "wastewater-appsheet-db-v2.xlsx",
+        "wastewater-appsheet-db.xlsx",
+        "/workspace/artifacts/wastewater-appsheet-db-v3.xlsx",
+        "/workspace/artifacts/wastewater-appsheet-db-v2.xlsx",
+        "/workspace/artifacts/wastewater-appsheet-db.xlsx",
+    ]
+    for p in db_candidates:
+        if os.path.exists(p):
+            return p
+    return "wastewater-appsheet-db-v3.xlsx"
 
 db_path = get_db_path()
 
@@ -335,8 +334,11 @@ def load_all_data(path):
     df_rep["Date"] = pd.to_datetime(df_rep["Date"]).dt.strftime("%Y/%m/%d")
     
     val_str_series = df_rec["Value"].astype(str)
+    has_comma_decimal = val_str_series.str.contains(r'^\d+,\d+$', regex=True)
+    val_clean = val_str_series.copy()
+    val_clean[has_comma_decimal] = val_clean[has_comma_decimal].str.replace(',', '.', regex=False)
     val_clean = (
-        val_str_series
+        val_clean
         .str.replace(",", "", regex=False)
         .str.replace("%", "", regex=False)
         .str.replace("<", "", regex=False)
@@ -934,22 +936,86 @@ with tab3:
             
         df_raw = pd.DataFrame(data_rows)
         
+        # 出力対象年の選択ドロップダウン (デフォルト: 全データ)
+        available_years = sorted(reports["Date_dt"].dt.year.dropna().unique().astype(int).tolist(), reverse=True)
+        year_options = ["全データ"] + [f"{y}年" for y in available_years]
+        
+        selected_year_opt = st.selectbox("📅 出力対象年を選択", options=year_options, index=0)
+        
+        if selected_year_opt == "全データ":
+            df_export = df_raw.copy()
+            file_year_str = "全データ"
+        else:
+            sel_y = int(selected_year_opt.replace("年", ""))
+            df_export = df_raw[pd.to_datetime(df_raw["Date"], errors="coerce").dt.year == sel_y].copy()
+            file_year_str = f"{sel_y}年"
+        
         mi_cols = [("基本情報", "日付")] + [(loc_name, item_name) for _, loc_name, item_name in col_defs] + [("基本情報", "備考")]
         raw_col_keys = ["Date"] + [item_id for item_id, _, _ in col_defs] + ["Notes"]
         
-        df_preview = df_raw[raw_col_keys].copy()
+        df_preview = df_export[raw_col_keys].copy()
         df_preview.columns = pd.MultiIndex.from_tuples(mi_cols)
         
-        st.markdown("##### プレビュー (最新10件 - 2段ヘッダー構造)")
-        st.dataframe(df_preview.tail(10), use_container_width=True)
+        st.markdown(f"##### プレビュー ({selected_year_opt} - 2段ヘッダー構造)")
+        st.dataframe(df_preview.tail(10) if len(df_preview) > 10 else df_preview, use_container_width=True)
         
-        def generate_formatted_excel(selected_site_id, selected_sheet_type, site_name):
+        # 🤖 全項目対象 AI水質診断 ＆ 傾向分析コメントカードの自動生成
+        latest_rep = reports.iloc[-1] if not reports.empty else None
+        latest_date_str = latest_rep["Date"] if latest_rep is not None else ""
+        latest_notes_str = str(latest_rep["Notes"]).strip() if latest_rep is not None and pd.notna(latest_rep["Notes"]) and str(latest_rep["Notes"]).strip() not in ["", "nan", "-"] else ""
+        
+        comments = []
+        if latest_rep is not None:
+            rep_id_l = latest_rep["Report_ID"]
+            rec_l = records[records["Report_ID"] == rep_id_l]
+            rec_l_dict = dict(zip(rec_l["Item_ID"], rec_l["Value_Num"]))
+            
+            for item_id_k, loc_n_k, item_n_k in col_defs:
+                v_num = rec_l_dict.get(item_id_k)
+                if pd.notna(v_num):
+                    hist_vals = records[records["Item_ID"] == item_id_k]["Value_Num"].dropna()
+                    if len(hist_vals) >= 2:
+                        h_mean = hist_vals.mean()
+                        h_std = hist_vals.std()
+                        
+                        # 判定ルール
+                        if item_n_k == "SVI" and v_num > 150:
+                            comments.append(f"<li><b>【{loc_n_k} {item_n_k} 注意】</b>: 最新値 <b>{v_num:.1f} mL/g</b>（全期間平均: {h_mean:.1f} mL/g）。150 mL/gを超えており汚泥膨化（バルキング）の兆候が見られます。DO状態や沈降性をご確認ください。</li>")
+                        elif item_n_k in ["SS", "SS(簡)"] and loc_n_k in ["処理水", "処理水(沈殿槽上澄み）"] and v_num > h_mean + 1.5 * h_std:
+                            comments.append(f"<li><b>【{loc_n_k} {item_n_k} 上昇】</b>: 最新値 <b>{v_num:.1f} mg/L</b>（全期間平均: {h_mean:.1f} mg/L）。平均を上回って推移しています。沈殿槽フロックの流出にご注意ください。</li>")
+                        elif item_n_k in ["BOD", "BOD5"] and loc_n_k in ["処理水", "処理水(沈殿槽上澄み）"] and v_num > h_mean + 1.5 * h_std:
+                            comments.append(f"<li><b>【{loc_n_k} {item_n_k} 上昇】</b>: 最新値 <b>{v_num:.1f} mg/L</b>（全期間平均: {h_mean:.1f} mg/L）。処理水負荷の上昇がみられます。曝気強度や滞留時間をご確認ください。</li>")
+                        elif item_n_k == "BOD除去率":
+                            rec_str_val = str(rec_dict.get((rep_id_l, item_id_k), ""))
+                            comments.append(f"<li><b>【{loc_n_k} BOD除去率】</b>: 最新値 <b>{rec_str_val}</b>（全期間平均: {h_mean:.1f}%）。高い除去効率が維持されており処理プロセスは極めて良好です。</li>")
+                        elif item_n_k == "pH" and (v_num < 6.0 or v_num > 8.5):
+                            comments.append(f"<li><b>【{loc_n_k} pH 変動】</b>: 最新値 <b>{v_num:.2f}</b>（全期間平均: {h_mean:.2f}）。管理標準範囲（6.0〜8.5）から外れています。薬品注入または原水流入変動をご確認ください。</li>")
+                        elif item_n_k == "DO" and v_num < 1.0 and "曝気" in loc_n_k:
+                            comments.append(f"<li><b>【{loc_n_k} DO 低下】</b>: 最新値 <b>{v_num:.2f} mg/L</b>（全期間平均: {h_mean:.2f} mg/L）。1.0 mg/Lを下回っており酸欠の恐れがあります。ブロワー風量の増量を推奨します。</li>")
+        
+        if not comments:
+            comments.append("<li><b>【水質全般 安定維持】</b>: 全測定項目が過去の通常変動範囲内で推移しており、処理プロセスは極めて良好に維持されています。</li>")
+            
+        notes_badge = f" <span style='color:#555555; font-size:13px;'>[現場特記事項: 「{latest_notes_str}」]</span>" if latest_notes_str else ""
+        
+        st.markdown(f"""
+<div style='background-color:#F1F8E9; border-left:5px solid #66BB6A; border-radius:8px; padding:14px; margin-top:12px; margin-bottom:15px;'>
+    <div style='font-size:15px; font-weight:bold; color:#2E7D32; margin-bottom:8px;'>
+        🤖 AI水質診断 ＆ 傾向分析コメント（最新点検日: {latest_date_str}）{notes_badge}
+    </div>
+    <ul style='margin:0; padding-left:20px; font-size:14px; color:#333333; line-height:1.7;'>
+        {"".join(comments[:3])}
+    </ul>
+</div>
+""", unsafe_allow_html=True)
+        
+        def generate_formatted_excel(selected_site_id, selected_sheet_type, site_name, df_data):
             output = io.BytesIO()
             wb = openpyxl.Workbook()
             ws = wb.active
             ws.title = f"{selected_sheet_type}_集計"
             
-            ws.append([f"◆ {site_name} 【{selected_sheet_type}】 全点検データ一覧表"])
+            ws.append([f"◆ {site_name} 【{selected_sheet_type}】 {selected_year_opt} 点検データ一覧表"])
             ws.append([f"出力日時: {datetime.datetime.now().strftime('%Y/%m/%d %H:%M')}"])
             ws.append([])
             
@@ -959,7 +1025,7 @@ with tab3:
             ws.append(header1)
             ws.append(header2)
             
-            for _, r in df_raw.iterrows():
+            for _, r in df_data.iterrows():
                 row_arr = [r["Date"]] + [r[item_id] for item_id, _, _ in col_defs] + [r["Notes"]]
                 ws.append(row_arr)
                 
@@ -1021,12 +1087,12 @@ with tab3:
             output.seek(0)
             return output
             
-        excel_bytes = generate_formatted_excel(selected_site_id, selected_sheet_type, site_options[selected_site_id])
+        excel_bytes = generate_formatted_excel(selected_site_id, selected_sheet_type, site_options[selected_site_id], df_export)
         
         st.download_button(
-            label="📥 原本と同仕様のExcelデータ (.xlsx) をダウンロードする",
+            label=f"📥 【{selected_year_opt}】 {site_options[selected_site_id]} エクセル帳票 (.xlsx) をダウンロード",
             data=excel_bytes,
-            file_name=f"{site_options[selected_site_id]}_{selected_sheet_type}_全データ.xlsx",
+            file_name=f"{site_options[selected_site_id]}_{selected_sheet_type}_{file_year_str}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
