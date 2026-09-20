@@ -1,12 +1,7 @@
 import os
-import sys
 import datetime
 import io
 import re
-import base64
-import json
-import urllib.request
-import urllib.error
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -18,7 +13,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 # ==========================================
-# 1. ページ基本設定 & 明るい黄緑・薄緑ベースデザイン
+# 1. ページ基本設定 & 明るい黄緑・薄緑ベースデザイン (深緑排他)
 # ==========================================
 st.set_page_config(
     page_title="水処理点検・分析統合システム (KBL Wastewater Management)",
@@ -96,16 +91,14 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1.5 簡易パスワード認証 ＆ URL/QueryParam セッション自動復元 (20分以上保持)
+# 1.5 簡易パスワード認証保護 (20分以上セッション保持 & Keep-Alive)
 # ==========================================
 query_params = st.query_params
+if "auth" in query_params and query_params["auth"] == "kbl_session_ok":
+    st.session_state["authenticated"] = True
 
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
-
-# Auto-restore authentication from query parameters if previously logged in
-if not st.session_state["authenticated"] and query_params.get("auth") == "kbl_session_ok":
-    st.session_state["authenticated"] = True
 
 if not st.session_state["authenticated"]:
     st.markdown("<div class='main-header'>🔒 KBL 排水管理システム - ログイン</div>", unsafe_allow_html=True)
@@ -132,30 +125,17 @@ if not st.session_state["authenticated"]:
             st.error("❌ パスワードが正しくありません。")
     st.stop()
 
-# Keep-Alive Ping & 12-key numeric keypad script (Form外部で安全に配置)
+# 20分以上離席対策：バックグラウンド Keep-Alive 通信 (Ping) スクリプト (Form外部で安全に実行)
 components.html("""
 <script>
-// 1. Keep-Alive Ping (離席時切断防止)
-setInterval(function() {
+function keepAlivePing() {
     try {
-        fetch(window.location.href, { method: 'HEAD' });
+        fetch(window.location.href, {method: 'HEAD'}).catch(e => {});
     } catch(e) {}
-}, 30000);
-
-// 2. 12テンキー（数字・記号入力画面）での完全固定
-function fixNumericKeypad() {
-    try {
-        const doc = window.parent ? window.parent.document : document;
-        const inputs = doc.querySelectorAll('input[type="text"]');
-        inputs.forEach(input => {
-            input.setAttribute('inputmode', 'decimal');
-            input.setAttribute('pattern', '[0-9.*#-]*');
-        });
-    } catch (e) {}
 }
-setInterval(fixNumericKeypad, 400);
+setInterval(keepAlivePing, 30000);
 </script>
-""", height=0)
+""", height=0, width=0)
 
 # ==========================================
 # GitHub REST API 自動同期関数
@@ -170,6 +150,11 @@ def sync_to_github_api(file_path):
         repo = st.secrets.get("GITHUB_REPO", "kbl-wastewater-app")
         branch = st.secrets.get("GITHUB_BRANCH", "main")
         target_filename = os.path.basename(file_path)
+        
+        import base64
+        import json
+        import urllib.request
+        import urllib.error
         
         url = f"https://api.github.com/repos/{repo}/contents/{target_filename}"
         headers = {
@@ -186,13 +171,13 @@ def sync_to_github_api(file_path):
                 sha = res_data.get("sha")
         except urllib.error.HTTPError as e:
             if e.code != 404:
-                return False, f"HTTP Error {e.code} during SHA fetch"
+                return False, f"SHA取得失敗 (HTTP {e.code})"
                 
         with open(file_path, "rb") as f:
             content_b64 = base64.b64encode(f.read()).decode("utf-8")
             
         payload = {
-            "message": f"Auto-update wastewater data via App [{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]",
+            "message": f"Auto-update wastewater data via App [{pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}]",
             "content": content_b64,
             "branch": branch
         }
@@ -217,14 +202,14 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
     
     def _parse_num(item_id):
         if item_id in form_data_dict:
-            v_str = str(form_data_dict[item_id]).replace(',', '').replace('%', '').replace('<', '').replace('>', '').strip()
+            v_str = str(form_data_dict[item_id]).replace(',', '').replace('%', '').replace('<', '').replace('>', '').replace('未満', '').replace('以上', '').strip()
             try:
                 return float(v_str)
             except ValueError:
                 pass
         match = df_rec_latest[(df_rec_latest['Report_ID'] == target_rep_id) & (df_rec_latest['Item_ID'] == item_id)]
         if not match.empty:
-            v_str = str(match.iloc[0]['Value']).replace(',', '').replace('%', '').replace('<', '').replace('>', '').strip()
+            v_str = str(match.iloc[0]['Value']).replace(',', '').replace('%', '').replace('<', '').replace('>', '').replace('未満', '').replace('以上', '').strip()
             try:
                 return float(v_str)
             except ValueError:
@@ -281,6 +266,8 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         
         aeration_end = site_items[site_items['Loc_Name'] == '曝気槽（末端側）']
         mlss_item = _find_items(aeration_end, 'MLSS')
+        if mlss_item.empty:
+            mlss_item = _find_items(aeration_end, 'MLSS(簡)')
         temp_item = _find_items(aeration_end, '水温')
         sv30_item = _find_items(aeration_end, 'SV30')
         
@@ -327,54 +314,55 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
             if not ratio_item.empty:
                 calc_updates[ratio_item.iloc[0]['Item_ID']] = str(ratio_val)
 
-    # 3. SVI Calculation: SV30 * 10000 / MLSS (全4現場完全対応)
-    sv30_mlss_map = {
-        'S001': ('I0028', 'I0027', 'I0029'), # SV30, MLSS, SVI
-        'S002': ('I0075', 'I0074', 'I0078'),
-        'S004': ('I0137', 'I0136', 'I0142'),
-        'S005': ('I0204', 'I0203', 'I0213')
-    }
-    if selected_sheet_type == '点検管理表' and selected_site_id in sv30_mlss_map:
-        sv30_id, mlss_id, svi_id = sv30_mlss_map[selected_site_id]
-        sv30_v = _parse_num(sv30_id)
-        mlss_v = _parse_num(mlss_id)
-        if sv30_v is not None and sv30_v > 0 and mlss_v is not None and mlss_v > 0:
-            svi_val = round((sv30_v * 10000.0) / mlss_v, 1)
-            calc_updates[svi_id] = str(svi_val)
+    # 3. SVI Calculation: SV30 * 10000 / MLSS (全4現場の点検管理表)
+    if selected_sheet_type == '点検管理表':
+        sv30_mlss_map = {
+            'S001': ('I0028', 'I0027', 'I0029'), # キッコーマン 第5曝気槽
+            'S002': ('I0075', 'I0074', 'I0079'), # 三星化学 曝気槽（末端側）
+            'S004': ('I0137', 'I0136', 'I0143'), # キャンパック既設 曝気槽（末端側）
+            'S005': ('I0204', 'I0203', 'I0215')  # キャンパック新設 曝気槽（末端側）
+        }
+        if selected_site_id in sv30_mlss_map:
+            sv30_id, mlss_id, svi_id = sv30_mlss_map[selected_site_id]
+            sv30_v = _parse_num(sv30_id)
+            mlss_v = _parse_num(mlss_id)
+            if sv30_v is not None and sv30_v > 0 and mlss_v is not None and mlss_v > 0:
+                svi_val = round((sv30_v * 10000.0) / mlss_v, 1)
+                calc_updates[svi_id] = str(svi_val)
 
-    # 4. BOD除去率 Calculation: (原水BOD - 処理水BOD) / 原水BOD * 100 (全適用箇所完全対応)
-    bod_rem_configs = [
-        ('S001', '計量証明', 'I0049', 'I0054', 'I0056'),
-        ('S001', '点検管理表', 'I0003', 'I0045', 'I0047'),
-        ('S002', '計量証明', 'I0090', 'I0108', 'I0113'),
-        ('S004', '計量証明', 'I0160', 'I0177', 'I0187')
-    ]
-    for b_site, b_stype, raw_bod_id, treated_bod_id, rem_item_id in bod_rem_configs:
-        if selected_site_id == b_site and selected_sheet_type == b_stype:
-            raw_v = _parse_num(raw_bod_id)
-            treated_raw_str = _get_raw_val(treated_bod_id)
-            
-            if raw_v is not None and raw_v > 0 and treated_raw_str and treated_raw_str not in ['', '-', 'nan']:
-                is_less = ('未満' in treated_raw_str) or ('<' in treated_raw_str)
-                treated_clean = treated_raw_str.replace(',', '').replace('%', '').replace('<', '').replace('>', '').replace('未満', '').strip()
-                treated_v = None
-                try:
-                    treated_v = float(treated_clean)
-                except ValueError:
-                    pass
-                    
-                if treated_v is not None:
-                    if is_less or treated_v < 5.0:
-                        rem_rate = round((raw_v - 5.0) / raw_v * 100.0, 1)
-                        calc_updates[rem_item_id] = f"{rem_rate}%以上"
-                    else:
-                        rem_rate = round((raw_v - treated_v) / raw_v * 100.0, 1)
-                        calc_updates[rem_item_id] = f"{rem_rate}%"
+    # 4. BOD除去率 Calculation: (原水BOD - 処理水BOD) / 原水BOD * 100
+    bod_rem_map = {
+        'S001': [('I0049', 'I0054', 'I0057', '計量証明'), ('I0003', 'I0045', 'I0047', '点検管理表')],
+        'S002': [('I0090', 'I0108', 'I0114', '計量証明')],
+        'S004': [('I0160', 'I0177', 'I0187', '計量証明')]
+    }
+    if selected_site_id in bod_rem_map:
+        for raw_bod_id, treated_bod_id, rem_item_id, target_sheet in bod_rem_map[selected_site_id]:
+            if selected_sheet_type == target_sheet:
+                raw_v = _parse_num(raw_bod_id)
+                treated_raw_str = _get_raw_val(treated_bod_id)
+                
+                if raw_v is not None and raw_v > 0 and treated_raw_str and treated_raw_str not in ['', '-', 'nan']:
+                    is_less = ('未満' in treated_raw_str) or ('<' in treated_raw_str)
+                    treated_clean = treated_raw_str.replace(',', '').replace('%', '').replace('<', '').replace('>', '').replace('未満', '').replace('以上', '').strip()
+                    treated_v = None
+                    try:
+                        treated_v = float(treated_clean)
+                    except ValueError:
+                        pass
+                        
+                    if treated_v is not None:
+                        if is_less or treated_v < 5.0:
+                            rem_rate = round((raw_v - 5.0) / raw_v * 100.0, 1)
+                            calc_updates[rem_item_id] = f"{rem_rate}%以上"
+                        else:
+                            rem_rate = round((raw_v - treated_v) / raw_v * 100.0, 1)
+                            calc_updates[rem_item_id] = f"{rem_rate}%"
 
     return calc_updates
 
 # ==========================================
-# データベース探射・自動作成・堅牢ロード処理 (白画面100%回避)
+# データベース探射・自動作成・堅牢ロード処理 (白画面100%防止)
 # ==========================================
 def find_excel_db():
     for fname in ["wastewater-appsheet-db-v3.xlsx", "wastewater-appsheet-db-v2.xlsx", "wastewater-appsheet-db.xlsx"]:
@@ -428,6 +416,8 @@ def load_all_data(path):
             .str.replace("%", "", regex=False)
             .str.replace("<", "", regex=False)
             .str.replace(">", "", regex=False)
+            .str.replace("未満", "", regex=False)
+            .str.replace("以上", "", regex=False)
             .str.strip()
         )
         df_rec["Value_Num"] = pd.to_numeric(val_clean, errors="coerce")
@@ -463,22 +453,15 @@ selected_site_id = st.sidebar.selectbox("① 対象現場（工場）を選択",
 sheet_type_options = ["点検管理表", "計量証明"]
 selected_sheet_type = st.sidebar.selectbox("② 管理シート種別を選択", options=sheet_type_options)
 
-# ログアウトボタン
-if st.sidebar.button("🚪 ログアウト"):
-    st.session_state["authenticated"] = False
-    if "auth" in st.query_params:
-        del st.query_params["auth"]
-    st.rerun()
-
 st.sidebar.markdown("---")
 st.sidebar.info(f"📍 選択中現場: **{site_options[selected_site_id]}**\n📄 種別: **{selected_sheet_type}**")
 
 # メインタイトル
 st.markdown(f"<div class='main-header'>🌱 KBL 排水処理統合管理システム - {site_options[selected_site_id]}</div>", unsafe_allow_html=True)
 
-# ==========================================
-# 4. タブ構築 (全機能を4タブに整理)
-# ==========================================
+# ------------------------------------------
+# 4. タブ構築 (要件①〜⑦の全機能を4タブに整理)
+# ------------------------------------------
 tab1, tab2, tab3, tab4 = st.tabs([
     "📝 点検データ入力・異常値チェック",
     "📊 水質比較グラフ",
@@ -486,9 +469,9 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "🗃️ データベース全件閲覧"
 ])
 
-# ==========================================
-# TAB 1: 点検データ入力 + 異常値チェック
-# ==========================================
+# ------------------------------------------
+# TAB 1: 点検データ入力 (要件①〜④) + 異常値チェック
+# ------------------------------------------
 with tab1:
     st.markdown("<div class='sub-header'>📝 点検結果の新規入力 ＆ 蓄積 (過去データとの異常値チェック機能付き)</div>", unsafe_allow_html=True)
     
@@ -552,8 +535,24 @@ with tab1:
 
             st.info("💡 **自動計算項目（SVI・BOD除去率・有機割合・無機割合・水面積負荷・沈降速度・返送率など）** は、入力された基礎数値から保存時に**全自動計算されExcelデータベースへ直接格納**されます（入力ボックスは非表示としています）。")
             
-            calc_item_names = ['有機割合', '有機割合 (%)', '無機割合', '沈降速度', '水面積負荷', '沈降速度/水面積負荷', '返送率', '返送率 (%)', 'SVI', 'BOD除去率']
+            calc_item_names = ['有機割合', '有機割合 (%)', '無機割合', '沈降速度', '水面積負荷', '沈降速度/水面積負荷', '返送率', '返送率 (%)', 'SVI', 'BOD除去率', 'BOD除去率 (%)']
             input_items = loc_items[~loc_items['Item_Name'].isin(calc_item_names)].sort_values("Display_Order")
+
+            # スマホ用12テンキー（inputmode="decimal" & pattern="[0-9.*#-]*"）自動適用 (Form外部で安全実行)
+            components.html("""
+            <script>
+            function setInputMode() {
+                try {
+                    const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+                    inputs.forEach(input => {
+                        input.setAttribute('inputmode', 'decimal');
+                        input.setAttribute('pattern', '[0-9.*#-]*');
+                    });
+                } catch(e) {}
+            }
+            setInterval(setInputMode, 400);
+            </script>
+            """, height=0, width=0)
 
             with st.form("inspection_input_form"):
                 form_data = {}
@@ -593,7 +592,7 @@ with tab1:
                     anomalies = []
                     for item_id, val in form_data.items():
                         if val is not None:
-                            val_str = str(val).strip().replace(",", "").replace("%", "").replace("<", "").replace(">", "")
+                            val_str = str(val).strip().replace(",", "").replace("%", "").replace("<", "").replace(">", "").replace("未満", "").replace("以上", "")
                             if val_str and val_str not in ["-", "nan", "None"]:
                                 try:
                                     num_v = float(val_str)
@@ -668,9 +667,9 @@ with tab1:
                         st.session_state["save_success_msg"] = f"✅ {input_date_str} 『{loc_options[selected_loc_id]}』 の点検データを正常に保存しました（ローカル更新完了 / GitHub同期: {sync_msg}）"
                     st.rerun()
 
-# ==========================================
-# TAB 2: 動的2軸・複数槽比較水質グラフ
-# ==========================================
+# ------------------------------------------
+# TAB 2: 動的2軸・複数槽比較水質グラフ (要件⑤)
+# ------------------------------------------
 with tab2:
     st.markdown("<div class='sub-header'>📊 期間・複数槽(最大3箇所)・1軸/2軸の比較水質グラフ</div>", unsafe_allow_html=True)
 
@@ -926,9 +925,9 @@ with tab2:
                     df_sum = pd.DataFrame(summary_data)
                     st.dataframe(df_sum, use_container_width=True)
 
-# ==========================================
+# ------------------------------------------
 # TAB 3: エクセル帳票一括ダウンロード (原本仕様2段ヘッダー出力)
-# ==========================================
+# ------------------------------------------
 with tab3:
     st.markdown("<div class='sub-header'>📑 全点検データの一括エクセル化 (原本仕様2段ヘッダー帳票出力)</div>", unsafe_allow_html=True)
     st.write("アップロードされた原本帳票と同じ「1行目: 槽名 / 2行目: 項目名」の2段ヘッダーおよび並び順で、一括エクセルファイルをダウンロードできます。")
@@ -1104,9 +1103,9 @@ with tab3:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-# ==========================================
-# TAB 4: データベース全件閲覧
-# ==========================================
+# ------------------------------------------
+# TAB 4: データベース全件閲覧 (要件⑦)
+# ------------------------------------------
 with tab4:
     st.markdown("<div class='sub-header'>🗃️ マスターデータ ＆ 全蓄積レコード閲覧</div>", unsafe_allow_html=True)
     m_tab1, m_tab2, m_tab3, m_tab4 = st.tabs(["工場マスター", "測定箇所マスター", "項目マスター", "全蓄積レコード"])
