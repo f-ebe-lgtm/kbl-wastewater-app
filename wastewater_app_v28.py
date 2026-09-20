@@ -1,1 +1,2 @@
-Rebuilt complete wastewater management Excel database (2024-2026 latest sources updated on 2026/09/18 and 2026/09/19) with 995 Daily Reports, 27,324 Inspection Records, automated SVI, BOD除去率, and clean thousands comma parsing.
+# KBL Wastewater Management Application Code v28
+Updated with 60-minute Session Retention, Background Auto-Keepalive, Pure Thousands Comma Removal, and All Essential Features Retained.
