@@ -1,8 +1,12 @@
 import os
-import sys
 import datetime
 import io
 import re
+import base64
+import json
+import hashlib
+import urllib.request
+import urllib.error
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -23,7 +27,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# カスタムCSSスタイリング (黄緑・薄緑・白・グレーベース)
+# カスタムCSSスタイリング
 st.markdown("""
 <style>
     .main-header {
@@ -84,87 +88,106 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ==========================================
-# 1.5 簡易パスワード認証保護 (20分以上セッション保持 & 離席自動ログアウト防止)
-# ==========================================
-AUTH_PARAM_KEY = "auth"
-AUTH_VALID_TOKEN = "kbl_valid_session_2026"
+# ------------------------------------------
+# 安全な Secret 取得関数
+# ------------------------------------------
+def safe_get_secret(key, default=""):
+    try:
+        if hasattr(st, "secrets") and key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return default
 
-# Check URL Query Parameters or Session State
-query_auth_token = st.query_params.get(AUTH_PARAM_KEY, "")
+correct_pwd = safe_get_secret("APP_PASSWORD", "kbl2026")
 
+# ------------------------------------------
+# 1.5 簡易パスワード認証保護 (20分以上セッション保持 & 復元機能)
+# ------------------------------------------
 if "authenticated" not in st.session_state:
-    if query_auth_token == AUTH_VALID_TOKEN:
-        st.session_state["authenticated"] = True
-    else:
-        st.session_state["authenticated"] = False
+    st.session_state["authenticated"] = False
+
+now_ts = int(datetime.datetime.now().timestamp())
+qp_time = st.query_params.get("auth_time", None)
+qp_hash = st.query_params.get("auth_hash", None)
+
+if not st.session_state["authenticated"] and qp_time and qp_hash:
+    try:
+        auth_ts = int(qp_time)
+        expected_hash = hashlib.sha256(f"{correct_pwd}_{auth_ts}".encode()).hexdigest()[:16]
+        if qp_hash == expected_hash and (now_ts - auth_ts) < 7200:
+            st.session_state["authenticated"] = True
+            new_hash = hashlib.sha256(f"{correct_pwd}_{now_ts}".encode()).hexdigest()[:16]
+            st.query_params["auth_time"] = str(now_ts)
+            st.query_params["auth_hash"] = new_hash
+    except Exception:
+        pass
 
 if not st.session_state["authenticated"]:
-    if query_auth_token == AUTH_VALID_TOKEN:
-        st.session_state["authenticated"] = True
-        st.rerun()
-
     st.markdown("<div class='main-header'>🔒 KBL 排水管理システム - ログイン</div>", unsafe_allow_html=True)
     st.markdown("#### 🔑 パスワード認証")
-    st.write("関係者専用のシステムです。パスワードを入力してログインしてください。")
-    
     pwd_input = st.text_input("パスワード", type="password", key="login_pwd_key")
-    
-    correct_pwd = "kbl2026"
-    try:
-        if "APP_PASSWORD" in st.secrets:
-            correct_pwd = st.secrets["APP_PASSWORD"]
-        elif "PASSWORD" in st.secrets:
-            correct_pwd = st.secrets["PASSWORD"]
-    except Exception:
-        correct_pwd = "kbl2026"
-        
-    if st.button("🔓 ログイン") or (pwd_input and pwd_input == correct_pwd):
+    if pwd_input:
         if pwd_input == correct_pwd:
             st.session_state["authenticated"] = True
-            st.query_params[AUTH_PARAM_KEY] = AUTH_VALID_TOKEN
+            new_ts = int(datetime.datetime.now().timestamp())
+            new_hash = hashlib.sha256(f"{correct_pwd}_{new_ts}".encode()).hexdigest()[:16]
+            st.query_params["auth_time"] = str(new_ts)
+            st.query_params["auth_hash"] = new_hash
             st.rerun()
         else:
             st.error("❌ パスワードが正しくありません。")
     st.stop()
 else:
-    # Maintain query_params token so 20+ min inactivity refreshes restore session automatically
-    if st.query_params.get(AUTH_PARAM_KEY) != AUTH_VALID_TOKEN:
-        st.query_params[AUTH_PARAM_KEY] = AUTH_VALID_TOKEN
+    if qp_time:
+        try:
+            if now_ts - int(qp_time) > 300:
+                new_hash = hashlib.sha256(f"{correct_pwd}_{now_ts}".encode()).hexdigest()[:16]
+                st.query_params["auth_time"] = str(now_ts)
+                st.query_params["auth_hash"] = new_hash
+        except Exception:
+            pass
 
-# JavaScript Keep-Alive Ping (20分以上離席時の切断防止スクリプト)
+# バックグラウンド Ping ＆ スマホテンキー固定 (st.form の完全外側に配置)
 components.html("""
 <script>
-function keepSessionAlive() {
+setInterval(function() {
     try {
-        fetch(window.location.href, { method: 'HEAD', mode: 'no-cors' });
+        fetch(window.location.href, { method: 'HEAD', mode: 'no-cors' }).catch(function(e){});
+    } catch(e) {}
+}, 30000);
+
+function enforceNumericTenkey() {
+    try {
+        const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+        inputs.forEach(input => {
+            input.setAttribute('inputmode', 'decimal');
+            input.setAttribute('pattern', '[0-9.*#-]*');
+        });
     } catch(e) {}
 }
-setInterval(keepSessionAlive, 60000); // 1分ごとに通信維持
+setTimeout(enforceNumericTenkey, 300);
+setTimeout(enforceNumericTenkey, 1000);
+setInterval(enforceNumericTenkey, 2000);
 </script>
 """, height=0)
 
-# ==========================================
+# ------------------------------------------
 # GitHub REST API 自動同期関数
-# ==========================================
+# ------------------------------------------
 def sync_to_github_api(file_path):
     try:
-        if "GITHUB_TOKEN" not in st.secrets:
+        github_token = safe_get_secret("GITHUB_TOKEN", "")
+        if not github_token:
             return False, "st.secrets に GITHUB_TOKEN が設定されていません"
         
-        token = st.secrets["GITHUB_TOKEN"]
-        repo = st.secrets.get("GITHUB_REPO", "kbl-wastewater-app")
-        branch = st.secrets.get("GITHUB_BRANCH", "main")
+        repo = safe_get_secret("GITHUB_REPO", "kbl-wastewater-app")
+        branch = safe_get_secret("GITHUB_BRANCH", "main")
         target_filename = os.path.basename(file_path)
-        
-        import base64
-        import json
-        import urllib.request
-        import urllib.error
         
         url = f"https://api.github.com/repos/{repo}/contents/{target_filename}"
         headers = {
-            "Authorization": f"Bearer {token}",
+            "Authorization": f"Bearer {github_token}",
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "StreamlitApp"
         }
@@ -177,7 +200,7 @@ def sync_to_github_api(file_path):
                 sha = res_data.get("sha")
         except urllib.error.HTTPError as e:
             if e.code != 404:
-                return False, f"HTTP Error {e.code} during SHA fetch"
+                return False, f"HTTP Error {e.code} (SHA取得失敗)"
                 
         with open(file_path, "rb") as f:
             content_b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -195,15 +218,14 @@ def sync_to_github_api(file_path):
         
         with urllib.request.urlopen(req_put) as resp:
             if resp.status in [200, 201]:
-                return True, "Success"
+                return True, "成功"
             return False, f"HTTP Status {resp.status}"
     except Exception as ex:
         return False, str(ex)
 
-
-# ==========================================
-# 自動計算関数 (SVI, BOD除去率, 有機割合, 沈降速度, 水面積負荷, 返送率)
-# ==========================================
+# ------------------------------------------
+# 自動計算関数 (有機割合、無機割合、沈降速度、水面積負荷、返送率、SVI、BOD除去率)
+# ------------------------------------------
 def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_sheet_type, form_data_dict, df_rec_latest, target_rep_id):
     calc_updates = {}
     
@@ -270,13 +292,29 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         'S004': ('I0137', 'I0136', 'I0233'),
         'S005': ('I0204', 'I0203', 'I0234')
     }
-    if selected_sheet_type == '点検管理表' and selected_site_id in sv30_mlss_map:
-        sv30_id, mlss_id, svi_id = sv30_mlss_map[selected_site_id]
-        sv30_v = _parse_num(sv30_id)
-        mlss_v = _parse_num(mlss_id)
-        if sv30_v is not None and sv30_v > 0 and mlss_v is not None and mlss_v > 0:
-            svi_val = round((sv30_v * 10000.0) / mlss_v, 1)
-            calc_updates[svi_id] = str(svi_val)
+    if selected_sheet_type == '点検管理表':
+        if selected_site_id in sv30_mlss_map:
+            sv30_id, mlss_id, svi_id = sv30_mlss_map[selected_site_id]
+            sv30_v = _parse_num(sv30_id)
+            mlss_v = _parse_num(mlss_id)
+            if sv30_v is not None and sv30_v > 0 and mlss_v is not None and mlss_v > 0:
+                svi_val = round((sv30_v * 10000.0) / mlss_v, 1)
+                calc_updates[svi_id] = str(svi_val)
+        else:
+            # Dynamic fallback
+            site_items = df_item_all.merge(df_loc_all[df_loc_all['Site_ID'] == selected_site_id], on='Loc_ID')
+            site_items = site_items[site_items['Sheet_Type'] == '点検管理表']
+            sv30_item = _find_items(site_items, 'SV30')
+            mlss_item = _find_items(site_items, 'MLSS')
+            if mlss_item.empty:
+                mlss_item = _find_items(site_items, 'MLSS(簡)')
+            svi_item = _find_items(site_items, 'SVI')
+            if not sv30_item.empty and not mlss_item.empty and not svi_item.empty:
+                sv30_v = _parse_num(sv30_item.iloc[0]['Item_ID'])
+                mlss_v = _parse_num(mlss_item.iloc[0]['Item_ID'])
+                if sv30_v is not None and sv30_v > 0 and mlss_v is not None and mlss_v > 0:
+                    svi_val = round((sv30_v * 10000.0) / mlss_v, 1)
+                    calc_updates[svi_item.iloc[0]['Item_ID']] = str(svi_val)
 
     # 3. BOD除去率 Calculation: (原水BOD - 処理水BOD) / 原水BOD * 100
     bod_rem_map = {
@@ -324,6 +362,8 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
         
         aeration_end = site_items[site_items['Loc_Name'] == '曝気槽（末端側）']
         mlss_item = _find_items(aeration_end, 'MLSS')
+        if mlss_item.empty:
+            mlss_item = _find_items(aeration_end, 'MLSS(簡)')
         temp_item = _find_items(aeration_end, '水温')
         sv30_item = _find_items(aeration_end, 'SV30')
         
@@ -372,10 +412,9 @@ def calculate_auto_metrics(df_item_all, df_loc_all, selected_site_id, selected_s
                 
     return calc_updates
 
-
-# ==========================================
+# ------------------------------------------
 # データベース探射・自動作成・堅牢ロード処理
-# ==========================================
+# ------------------------------------------
 def find_excel_db():
     for fname in ["wastewater-appsheet-db-v3.xlsx", "wastewater-appsheet-db-v2.xlsx", "wastewater-appsheet-db.xlsx"]:
         if os.path.exists(fname):
@@ -384,16 +423,22 @@ def find_excel_db():
         if os.path.exists(abs_p):
             return abs_p
             
-    for root, _, files in os.walk("."): 
-        for file in files:
-            if file.endswith(".xlsx") and "wastewater" in file:
-                return os.path.join(root, file)
-                
-    if os.path.exists("/workspace/artifacts"):
-        for root, _, files in os.walk("/workspace/artifacts"):
+    try:
+        for root, _, files in os.walk("."):
             for file in files:
                 if file.endswith(".xlsx") and "wastewater" in file:
                     return os.path.join(root, file)
+    except Exception:
+        pass
+                
+    try:
+        if os.path.exists("/workspace/artifacts"):
+            for root, _, files in os.walk("/workspace/artifacts"):
+                for file in files:
+                    if file.endswith(".xlsx") and "wastewater" in file:
+                        return os.path.join(root, file)
+    except Exception:
+        pass
                     
     return None
 
@@ -412,7 +457,6 @@ def load_all_data(path):
         df_rep = pd.read_excel(xls, "Daily Report")
         df_rec = pd.read_excel(xls, "Inspection Records")
         
-        # 旧DBファイル(北越コーポレーション/S003)排除
         df_site = df_site[~df_site["Site_Name"].astype(str).str.contains("北越") & (df_site["Site_ID"] != "S003")]
         df_loc = df_loc[~df_loc["Site_ID"].isin(["S003"]) & df_loc["Site_ID"].isin(df_site["Site_ID"])]
         df_item = df_item[df_item["Loc_ID"].isin(df_loc["Loc_ID"])]
@@ -428,8 +472,8 @@ def load_all_data(path):
             .str.replace("%", "", regex=False)
             .str.replace("<", "", regex=False)
             .str.replace(">", "", regex=False)
-            .str.replace("以上", "", regex=False)
             .str.replace("未満", "", regex=False)
+            .str.replace("以上", "", regex=False)
             .str.strip()
         )
         df_rec["Value_Num"] = pd.to_numeric(val_clean, errors="coerce")
@@ -441,9 +485,9 @@ def load_all_data(path):
 loaded_data = load_all_data(db_path) if db_path else (None, None, None, None, None)
 df_site, df_loc, df_item, df_rep, df_rec = loaded_data
 
-# 万が一DBファイルが見つからない・読み込めない場合のGUIガイダンス (白画面を100%回避)
 if df_site is None:
-    st.warning("⚠️ **データベースファイル (`wastewater-appsheet-db-v3.xlsx`) が検出できませんでした。**")
+    st.markdown("<div class='main-header'>🌱 KBL 排水処理統合管理システム</div>", unsafe_allow_html=True)
+    st.warning("⚠️ **データベースファイル (`wastewater-appsheet-db-v3.xlsx`) が自動検出されませんでした。**")
     st.info("以下からデータベースExcelファイルをアップロードするか、GitHubリポジトリに `wastewater-appsheet-db-v3.xlsx` をコミットしてください。")
     
     uploaded_db = st.file_uploader("📁 データベースExcelファイルをアップロード", type=["xlsx"])
@@ -466,19 +510,14 @@ sheet_type_options = ["点検管理表", "計量証明"]
 selected_sheet_type = st.sidebar.selectbox("② 管理シート種別を選択", options=sheet_type_options)
 
 st.sidebar.markdown("---")
-st.sidebar.info(f"📍 選択中現場: **{site_options[selected_site_id]}**\n📄 種別: **{selected_sheet_type}**")
-
-# ログアウトボタン (ユーザーが明示的に終了する場合)
-if st.sidebar.button("🚪 ログアウト", key="sidebar_logout_button"):
-    st.session_state["authenticated"] = False
-    st.query_params.clear()
-    st.rerun()
+site_name_disp = site_options[selected_site_id]
+st.sidebar.info(f"📍 選択中現場: **{site_name_disp}**\n📄 種別: **{selected_sheet_type}**")
 
 # メインタイトル
 st.markdown(f"<div class='main-header'>🌱 KBL 排水処理統合管理システム - {site_options[selected_site_id]}</div>", unsafe_allow_html=True)
 
 # ------------------------------------------
-# 4. タブ構築 (要件①〜⑦の全機能を4タブに整理)
+# 4. タブ構築
 # ------------------------------------------
 tab1, tab2, tab3, tab4 = st.tabs([
     "📝 点検データ入力・異常値チェック",
@@ -488,7 +527,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
 ])
 
 # ------------------------------------------
-# TAB 1: 点検データ入力 (要件①〜④) + 異常値チェック
+# TAB 1: 点検データ入力 + 異常値チェック
 # ------------------------------------------
 with tab1:
     st.markdown("<div class='sub-header'>📝 点検結果の新規入力 ＆ 蓄積 (過去データとの異常値チェック機能付き)</div>", unsafe_allow_html=True)
@@ -555,26 +594,6 @@ with tab1:
             
             calc_item_names = ['有機割合', '有機割合 (%)', '無機割合', '沈降速度', '水面積負荷', '沈降速度/水面積負荷', '返送率', '返送率 (%)', 'SVI', 'BOD除去率']
             input_items = loc_items[~loc_items['Item_Name'].isin(calc_item_names)].sort_values("Display_Order")
-
-            # スマホ用 12テンキー（数字・記号）固定化 JavaScript (Form外部で継続発火)
-            components.html("""
-            <script>
-            function enforceNumericTenkey() {
-                try {
-                    const doc = window.parent.document;
-                    const inputs = doc.querySelectorAll('input[type="text"], input[type="number"], input:not([type])');
-                    inputs.forEach(input => {
-                        if (input.id && input.id.includes('login')) return;
-                        input.setAttribute('inputmode', 'decimal');
-                        input.setAttribute('pattern', '[0-9.*#-]*');
-                        input.setAttribute('autocomplete', 'off');
-                    });
-                } catch(e) {}
-            }
-            setInterval(enforceNumericTenkey, 400);
-            enforceNumericTenkey();
-            </script>
-            """, height=0)
 
             with st.form("inspection_input_form"):
                 form_data = {}
@@ -737,8 +756,6 @@ with tab2:
                     unique_item_names.append(iname)
                 if iname in ["無機割合", "有機割合", "返送率", "BOD除去率"]:
                     item_name_to_unit[iname] = " (%)"
-                elif iname == "SVI":
-                    item_name_to_unit[iname] = " (mL/g)"
                 elif uopt and uopt != "nan":
                     item_name_to_unit[iname] = f" ({uopt})"
                 elif iname not in item_name_to_unit:
@@ -948,7 +965,7 @@ with tab2:
                     st.dataframe(df_sum, use_container_width=True)
 
 # ------------------------------------------
-# TAB 3: エクセル帳票一括ダウンロード (原本仕様2段ヘッダー出力)
+# TAB 3: エクセル帳票一括ダウンロード (原本仕様2段ヘッダー出力 + 時系列AI水質診断)
 # ------------------------------------------
 with tab3:
     st.markdown("<div class='sub-header'>📑 全点検データの一括エクセル化 (原本仕様2段ヘッダー帳票出力)</div>", unsafe_allow_html=True)
@@ -999,32 +1016,136 @@ with tab3:
             df_export = df_raw[pd.to_datetime(df_raw["Date"], errors="coerce").dt.year == sel_y].copy()
             file_year_str = f"{sel_y}年"
 
-        # 全項目対象 AI水質診断 ＆ 傾向分析コメント
-        st.markdown("##### 🤖 全項目対象 AI水質診断 ＆ 傾向分析コメント")
-        ai_insights = []
-        if not df_export.empty:
-            for item_id, l_name, i_name in col_defs:
-                item_recs = df_rec[df_rec["Item_ID"] == item_id].dropna(subset=["Value_Num"])
-                if len(item_recs) >= 3:
-                    vals = item_recs["Value_Num"].values
-                    mean_v = np.mean(vals)
-                    std_v = np.std(vals)
-                    latest_v = vals[-1]
-                    if std_v > 0:
-                        z_score = (latest_v - mean_v) / std_v
-                        if z_score >= 2.0:
-                            ai_insights.append(f"・⚠️ **【{l_name}】{i_name}**: 最新値 `{latest_v:.1f}` (平均 `{mean_v:.1f}` より急上昇傾向/上限接近)")
-                        elif z_score <= -2.0:
-                            ai_insights.append(f"・💡 **【{l_name}】{i_name}**: 最新値 `{latest_v:.1f}` (平均 `{mean_v:.1f}` より低下傾向/注視推奨)")
-                            
-            last_rep_notes = reports.dropna(subset=["Notes"]).iloc[-1]["Notes"] if not reports.dropna(subset=["Notes"]).empty else ""
-            if last_rep_notes:
-                ai_insights.append(f"・📝 **最新現場メモ (特記事項)**: 「{last_rep_notes}」")
+        # 🤖 AI水質診断 ＆ 時系列傾向分析コメント (日付範囲指定トレンド検出)
+        def get_ai_analysis_comment_advanced(selected_site_id, selected_sheet_type, df_export_data, col_defs_list):
+            if df_export_data.empty:
+                return ""
+            
+            latest_row = df_export_data.iloc[-1]
+            latest_date = latest_row["Date"]
+            latest_note = str(latest_row["Notes"]).strip() if pd.notna(latest_row["Notes"]) else ""
+            salient_bullets = []
+            
+            for item_id, loc_name, item_name in col_defs_list:
+                series_vals = df_export_data[item_id].dropna().astype(str)
+                series_dates = df_export_data.loc[series_vals.index, "Date"].tolist()
                 
-        if ai_insights:
-            st.success("\n".join(ai_insights[:5]))
-        else:
-            st.success("✅ 全測定項目の最新データは過去の通常変動範囲内で安定推移しています。")
+                cleaned_nums = []
+                valid_dates = []
+                for idx_v, v in enumerate(series_vals):
+                    v_clean = str(v).replace(",", "").replace("%", "").replace("<", "").replace(">", "").replace("未満", "").replace("以上", "").strip()
+                    try:
+                        f_v = float(v_clean)
+                        cleaned_nums.append(f_v)
+                        valid_dates.append(series_dates[idx_v])
+                    except ValueError:
+                        pass
+                
+                if len(cleaned_nums) >= 2:
+                    mean_v = np.mean(cleaned_nums)
+                    std_v = np.std(cleaned_nums)
+                    l_v_num = cleaned_nums[-1]
+                    latest_raw_v = str(df_export_data.iloc[-1].get(item_id, ""))
+                    
+                    # トレンド区間検出 (直近連続変化または最大傾き区間)
+                    trend_msg = ""
+                    tr_suffix = ""
+                    if len(cleaned_nums) >= 3:
+                        # 1. 連続増減チェック
+                        inc_count = 0
+                        dec_count = 0
+                        for i in range(len(cleaned_nums)-1, 0, -1):
+                            if cleaned_nums[i] > cleaned_nums[i-1]:
+                                if dec_count > 0: break
+                                inc_count += 1
+                            elif cleaned_nums[i] < cleaned_nums[i-1]:
+                                if inc_count > 0: break
+                                dec_count += 1
+                            else:
+                                break
+                        
+                        unit_str = "%" if "割合" in item_name or "率" in item_name else (" mg/L" if "SS" in item_name or "BOD" in item_name or "COD" in item_name or "DO" in item_name else "")
+                        
+                        if inc_count >= 3:
+                            s_d = valid_dates[-(inc_count+1)]
+                            e_d = valid_dates[-1]
+                            trend_msg = f"<b>{s_d}〜{e_d}</b> にかけて {inc_count+1} 回連続で上昇傾向（{cleaned_nums[-(inc_count+1)]:.1f} ➔ {l_v_num:.1f}{unit_str}）"
+                            tr_suffix = f"（{s_d}〜{e_d} にかけて {inc_count+1} 回連続で上昇傾向）"
+                        elif dec_count >= 3:
+                            s_d = valid_dates[-(dec_count+1)]
+                            e_d = valid_dates[-1]
+                            trend_msg = f"<b>{s_d}〜{e_d}</b> にかけて {dec_count+1} 回連続で低下傾向（{cleaned_nums[-(dec_count+1)]:.1f} ➔ {l_v_num:.1f}{unit_str}）"
+                            tr_suffix = f"（{s_d}〜{e_d} にかけて {dec_count+1} 回連続で低下傾向）"
+                        elif len(cleaned_nums) >= 4:
+                            # 2. 直近4回での全体の振れ幅・区間チェック
+                            diff_pct = (l_v_num - cleaned_nums[-4]) / max(0.1, abs(cleaned_nums[-4]))
+                            s_d = valid_dates[-4]
+                            e_d = valid_dates[-1]
+                            if diff_pct >= 0.25:
+                                trend_msg = f"<b>{s_d}〜{e_d}</b> にかけて上昇傾向（{cleaned_nums[-4]:.1f} ➔ {l_v_num:.1f}{unit_str}）"
+                                tr_suffix = f"（{s_d}〜{e_d} にかけて上昇傾向）"
+                            elif diff_pct <= -0.25:
+                                trend_msg = f"<b>{s_d}〜{e_d}</b> にかけて低下傾向（{cleaned_nums[-4]:.1f} ➔ {l_v_num:.1f}{unit_str}）"
+                                tr_suffix = f"（{s_d}〜{e_d} にかけて低下傾向）"
+
+                    # 1. SVI 判定
+                    if item_name == "SVI":
+                        if l_v_num > 150:
+                            salient_bullets.append(f"<b>【{loc_name} SVI (汚泥膨化警報)】</b>: 最新値 <b>{l_v_num:.1f} mL/g</b>{tr_suffix}（全期間平均: {mean_v:.1f} mL/g）。指標値 150 mL/g を超えておりバルキング（膨化）傾向が見られます。DO管理および返送汚泥率の調整をご検討ください。")
+                        elif l_v_num <= 150:
+                            salient_bullets.append(f"<b>【{loc_name} SVI (汚泥沈降性)】</b>: 最新値 <b>{l_v_num:.1f} mL/g</b>{tr_suffix}（全期間平均: {mean_v:.1f} mL/g）。理想的な沈降範囲（150 mL/g以下）に収まっており、固液分離は極めて良好です。")
+                    
+                    # 2. BOD除去率 判定
+                    elif item_name == "BOD除去率":
+                        is_over = "以上" in str(latest_raw_v)
+                        disp_str = f"{l_v_num:.1f}%以上" if is_over else f"{l_v_num:.1f}%"
+                        if l_v_num >= 90:
+                            salient_bullets.append(f"<b>【{loc_name} BOD除去率 (処理性能)】</b>: 最新値 <b>{disp_str}</b>{tr_suffix}（全期間平均: {mean_v:.1f}%）。高い除去効果を維持しており、微生物活性・処理プロセスは非常に安定しています。")
+                        else:
+                            salient_bullets.append(f"<b>【{loc_name} BOD除去率 (処理低下注意)】</b>: 最新値 <b>{disp_str}</b>{tr_suffix}（全期間平均: {mean_v:.1f}%）。除去率低下傾向がうかがえます。原水負荷または曝気量の調整をおすすめします。")
+                    
+                    # 3. 処理水/放流SS 判定
+                    elif "処理" in loc_name and "SS" in item_name:
+                        if l_v_num > (mean_v + 2.0 * std_v) and mean_v > 0:
+                            salient_bullets.append(f"<b>【{loc_name} {item_name} (流出注意)】</b>: 最新値 <b>{latest_raw_v} mg/L</b>{tr_suffix}（全期間平均: {mean_v:.1f} mg/L）。全期間平均を上回って推移しています。沈殿槽フロックの流出有無をご確認ください。")
+                        elif l_v_num == 0 or "未満" in str(latest_raw_v):
+                            salient_bullets.append(f"<b>【{loc_name} {item_name} (透視度良好)】</b>: 最新値 <b>{latest_raw_v} mg/L</b>（全期間平均: {mean_v:.1f} mg/L）。透視度の高い清澄な処理水が得られています。")
+                    
+                    # 4. pH 異常判定 (6.0〜8.5 外れ)
+                    elif item_name in ["pH", "ph"]:
+                        if l_v_num < 6.0 or l_v_num > 8.5:
+                            salient_bullets.append(f"<b>【{loc_name} pH (中性域外れ)】</b>: 最新値 <b>{l_v_num:.2f}</b>{tr_suffix}（全期間平均: {mean_v:.2f}）。管理標準域 (6.0〜8.5) を外れています。原水流入およびアルカリ/酸注入状態をご確認ください。")
+                    
+                    # 5. 期間指定トレンド検出項目
+                    elif trend_msg:
+                        unit_str = "%" if "割合" in item_name or "率" in item_name else (" mg/L" if "SS" in item_name or "BOD" in item_name or "COD" in item_name or "DO" in item_name else "")
+                        salient_bullets.append(f"<b>【{loc_name} {item_name} (期間推移)】</b>: {trend_msg}（全期間平均: {mean_v:.2f}{unit_str}）。")
+                    
+                    # 6. その他の大幅乖離項目 (2.5σ 超え)
+                    elif std_v > 0 and abs(l_v_num - mean_v) > 2.5 * std_v:
+                        unit_str = "%" if "割合" in item_name or "率" in item_name else ""
+                        salient_bullets.append(f"<b>【{loc_name} {item_name} (変動検出)】</b>: 最新値 <b>{latest_raw_v}</b>（全期間平均: {mean_v:.2f}{unit_str}）。通常推移範囲からの変動が検出されました。")
+
+            if not salient_bullets:
+                salient_bullets.append("<b>【水質全般 安定維持】</b>: 全測定項目が過去の通常変動範囲内で推移しており、処理プロセスは極めて良好に維持されています。")
+                
+            note_html = f" <span style='color:#555555; font-size:13px;'>[現場メモ: 「{latest_note}」]</span>" if latest_note and latest_note != "nan" else ""
+            bullets_html = "".join([f"<li style='margin-bottom:6px;'>{b}</li>" for b in salient_bullets[:5]])
+            
+            html_content = f"""
+<div style='background-color:#F1F8E9; border-left:5px solid #66BB6A; border-radius:8px; padding:14px; margin-top:12px; margin-bottom:15px;'>
+    <div style='font-size:15px; font-weight:bold; color:#2E7D32; margin-bottom:8px;'>
+        🤖 AI水質診断 ＆ 傾向分析コメント（最新点検日: {latest_date}）{note_html}
+    </div>
+    <ul style='margin:0; padding-left:20px; font-size:14px; color:#333333; line-height:1.7;'>
+        {bullets_html}
+    </ul>
+</div>
+"""
+            return html_content
+
+        ai_comment_html = get_ai_analysis_comment_advanced(selected_site_id, selected_sheet_type, df_export, col_defs)
+        st.markdown(ai_comment_html, unsafe_allow_html=True)
 
         mi_cols = [("基本情報", "日付")] + [(loc_name, item_name) for _, loc_name, item_name in col_defs] + [("基本情報", "備考")]
         raw_col_keys = ["Date"] + [item_id for item_id, _, _ in col_defs] + ["Notes"]
